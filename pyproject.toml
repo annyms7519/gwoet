@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gwoet"
+version = "0.9.0"
+description = "Discrete Naive Bayes (DNB) and Graphical WoE Transformer (GWoET)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "annyms7519", email = "annyms7519@gmail.com" },
+]
+keywords = [
+    "machine-learning",
+    "graphical-lasso",
+    "naive-bayes",
+    "weight-of-evidence",
+    "feature-engineering",
+    "interpretable-machine-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "seaborn",
+]
+
+[project.urls]
+# Uncomment and update these URLs after creating the repository.
+# Homepage = "https://github.com/annyms7519/gnbt"
+# Repository = "https://github.com/annyms7519/gnbt"
+# Issues = "https://github.com/annyms7519/gnbt/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gwoet*"]
