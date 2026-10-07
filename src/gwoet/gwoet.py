@@ -83,6 +83,7 @@ Version: 0.9.0.5
 License: MIT
 """
 
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -1677,6 +1678,7 @@ def _draw_network_graph(
                 args['edge_color'] = edge_colors[0]
 
     nx.draw_networkx(G, **args)
+    plt.show()
 
     return args
 
