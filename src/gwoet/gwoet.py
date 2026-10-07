@@ -1,5 +1,4 @@
-"""
-gwoet.py
+"""gwoet.py
 
 This module provides functions and a class for Graphical Weight-of-Evidence
 Transformer (GWoET).
@@ -17,19 +16,10 @@ transform_dataset:
   Transform a dataset using a fitted graphical WoE transformer.
 
 gen_graph_data:
-  Generate a NetworkX Graph from a fitted graphical naive Bayes transformer.
+  Generate a NetworkX Graph from a fitted graphical WoE transformer.
 
 draw_graphical_model:
   Draw an undirected graphical model (Markov random field).
-
-make_l1_coefficient_dict:
-  Extract L1 logistic regression coefficients grouped by original variable.
-
-plot_l1_coefficients:
-  Plot L1 logistic regression coefficients by original variable.
-
-plot_l1_feature_coefficients:
-  Plot L1 logistic regression coefficients by transformed feature.
 
 Example
 -------
@@ -88,53 +78,107 @@ pcor = tfm.get_pcor()
 
 Author: annyms7519
 Created: 2024-07-05
-Last modified: 2026-08-27
-Version: 0.9.0
+Last modified: 2026-10-07
+Version: 0.9.0.5
 License: MIT
 """
-import matplotlib.pyplot as plt
+
 import networkx as nx
 import numpy as np
 import pandas as pd
-from scipy.stats import multivariate_normal
-import seaborn as sns
-from sklearn.compose import ColumnTransformer
-from sklearn.compose import make_column_selector as selector
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.covariance import graphical_lasso
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.utils import check_random_state
-from sklearn.utils.validation import check_consistent_length
+from sklearn.utils.validation import check_is_fitted
 
-from .dnb import (
-    apply_disc,
-    calculate_cross_fitted_woe,
-    calculate_woe,
-    generate_disc,
-    make_y_bool,
-    make_sample_weight,
-)
 
-MIN_IV = 0.02   # Minimum IV used for variable pruning.
-MAX_DEPTH = 10  # Maximum decision tree depth when target_degree="adaptive".
+# Package import; a standalone copy can use a sibling dnb.py.
+if __package__:
+    from .dnb import (
+        apply_disc,
+        calculate_cross_fitted_woe,
+        calculate_woe,
+        generate_disc,
+        make_sample_weight,
+    )
+else:
+    from dnb import (
+        apply_disc,
+        calculate_cross_fitted_woe,
+        calculate_woe,
+        generate_disc,
+        make_sample_weight,
+    )
+
+
+# constants
+GAMMA = 1.0             # EBIC high-dimensional penalty parameter.
+EBIC_THRESHOLD = False  # Whether to threshold weak precision-matrix elements.
+PRUNING_RATIO = 0.0     # Fraction of weakest partial-correlation edges to prune.
+ZERO_TOL = 1e-8         # Numerical tolerance for zero precision entries.
+MIN_IV = 0.02           # Minimum IV used for variable pruning.
+
+
+def _validate_real(
+    value,
+    name,
+    *,
+    minimum=0.0,
+    strict=False,
+):
+    """
+    Validate a finite real scalar.
+
+    Boolean values are not treated as numeric values.
+    The lower bound can be inclusive or exclusive.
+    """
+    if (
+        not isinstance(
+            value,
+            (int, float, np.integer, np.floating),
+        )
+        or isinstance(
+            value,
+            (bool, np.bool_),
+        )
+    ):
+        raise TypeError(
+            f"{name} must be a real number."
+        )
+
+    value = float(value)
+
+    if (
+        not np.isfinite(value)
+        or (value <= minimum if strict else value < minimum)
+    ):
+        relation = (
+            "greater than" if strict else "at least"
+        )
+        raise ValueError(
+            f"{name} must be finite and {relation} {minimum}."
+        )
+
+    return value
+
+
+# ============================================================
+# Graphical WoE transformer
+# ============================================================
 
 def graphical_woe_transformer(
     X,
     y,
+    *,
     weight=None,
     discretizer='bic',
     cross_fitting=True,
     n_splits=5,
     shuffle=True,
-    l1_selection=False,
-    target_degree='adaptive',
-    min_iv=MIN_IV,
+    gamma=GAMMA,
+    ebic_threshold=EBIC_THRESHOLD,
+    pruning_ratio=PRUNING_RATIO,
     numeric=True,
     random_state=None,
     verbose=False,
@@ -166,14 +210,17 @@ def graphical_woe_transformer(
         Whether to shuffle observations before constructing the
         cross-fitting folds. This argument is used only when
         cross_fitting is True.
-      l1_selection:
-        Whether to select variables using L1-penalized logistic regression.
-      target_degree:
-        Target average degree of the graph. If "adaptive", the target
-        degree is determined automatically. If None, the full graph is used.
-      min_iv:
-        Minimum information value (IV) used for variable pruning.
-        If less than or equal to 0, IV-based pruning is not performed.
+      gamma:
+        Non-negative EBIC high-dimensional penalty parameter used when
+        selecting the Graphical Lasso regularization strength. Larger values
+        favor sparser EBIC solutions.
+      ebic_threshold:
+        Whether to apply the Jankova-van de Geer threshold to
+        precision-matrix elements before EBIC evaluation.
+      pruning_ratio:
+        Fraction of the weakest nonzero partial-correlation edges to remove
+        after EBIC estimation and optional EBIC thresholding. Must be in
+        [0, 1). A value of 0.2 removes approximately the weakest 20%.
       numeric:
         Whether to keep numerical variables as numerical variables.
         If False, numerical variables are discretized.
@@ -187,7 +234,11 @@ def graphical_woe_transformer(
         disc:
           Dictionary of discretizers whose keys are variable names.
         pcor:
-          DataFrame representing the partial correlation matrix.
+          Full EBIC-estimated partial correlation matrix, before percentage
+          pruning or IV pruning. Zero-norm WoE variables are excluded from
+          estimation. This matrix may contain variables/edges absent from
+          the final nodes/edges. If no WoE variable is estimable, a zero
+          placeholder matrix is returned with the original-feature fallback.
         numeric:
           Whether numerical variables are kept as numerical variables.
         nodes:
@@ -222,24 +273,27 @@ def graphical_woe_transformer(
     if not isinstance(shuffle, bool):
         raise TypeError("shuffle must be a boolean.")
 
-    if not isinstance(l1_selection, bool):
-        raise TypeError("l1_selection must be a boolean.")
+    gamma = _validate_real(
+        gamma,
+        "gamma",
+    )
 
-    if not (
-        target_degree == "adaptive"
-        or (
-            isinstance(target_degree, int)
-            and not isinstance(target_degree, bool)
-            and target_degree > 0
-        )
-        or target_degree is None
-    ):
-        raise ValueError(
-            "target_degree must be 'adaptive', a positive integer, or None."
-        )
+    if not X.columns.is_unique or not all(isinstance(c, str) for c in X.columns):
+        raise ValueError("X must have unique string column names.")
+    if X.shape[1] == 0 or len(X) == 0:
+        raise ValueError("X must contain observations and features.")
+    if pd.isna(y).any() or len(pd.unique(y)) != 2:
+        raise ValueError("y must contain exactly two nonmissing classes.")
 
-    if not isinstance(min_iv, (int, float)) or isinstance(min_iv, bool):
-        raise TypeError("min_iv must be numeric.")
+    if not isinstance(ebic_threshold, bool):
+        raise TypeError("ebic_threshold must be a boolean.")
+
+    pruning_ratio = _validate_real(
+        pruning_ratio,
+        "pruning_ratio",
+    )
+    if pruning_ratio >= 1.0:
+        raise ValueError("pruning_ratio must be less than 1.0.")
 
     if not isinstance(numeric, bool):
         raise TypeError("numeric must be a boolean.")
@@ -279,236 +333,200 @@ def graphical_woe_transformer(
         X,
     )
 
-    if cross_fitting:
-        woe_result = calculate_cross_fitted_woe(
-            X_d,
-            y,
-            weight,
-            n_splits=n_splits,
-            shuffle=shuffle,
-            random_state=random_state,
-        )
-    else:
-        woe_result = calculate_woe(
-            X_d,
-            y,
-            weight,
-        )
+    woe_result = _calculate_training_woe(
+        X_d,
+        y,
+        weight,
+        cross_fitting=cross_fitting,
+        n_splits=n_splits,
+        shuffle=shuffle,
+        random_state=random_state,
+    )
 
     woe_table = woe_result['woe_table']
-    y_bool = woe_result['y_bool']
 
-    # Romove variables of zero norm.
-    norm = np.linalg.norm(woe_table, axis=0)
+    # Remove variables of zero norm.
+    norm = np.linalg.norm(
+        woe_table,
+        axis=0,
+    )
     woe_table = woe_table[(woe_table.columns)[norm > 0]]
     X_d = X_d[woe_table.columns]
 
     if len(woe_table.columns) == 0:
-        print("All variables were pruned. The original features are used instead.")
-
-        nc = len(X.columns)
-        pcor = pd.DataFrame(
-            np.zeros((nc, nc)),
-            columns=X.columns,
-        )
-
-        transformer = {
-            'disc': disc,
-            'pcor': pcor,
-            'numeric': numeric,
-            'degree': 0,
-            'nodes': list(X.columns),
-            'edges': {},
-        }
-        return transformer
-
-    if l1_selection:
-        l1_result = _select_variables_l1_logistic(
-            X_woe=woe_table,
-            y=y,
-            weight=weight,
-            random_state=random_state,
-        )
-        nodes = l1_result["selected_variables"]
-        coef = l1_result["selected_coef"]
-        best_C = l1_result["best_C"]
         if verbose:
-            print(f"best_C={best_C:.3f}")
-            print(f"Nodes: {len(nodes)}")
-
-    else:
-        nodes = list(woe_table.columns)
-        if verbose:
-            print(f"Nodes: {len(nodes)}")
-
-    random_state = check_random_state(random_state)
-
-    if target_degree != 'adaptive':
-        td = target_degree
-
-    else:
-        td = MAX_DEPTH
-
-        cv = StratifiedKFold(
-            n_splits=5,
-            shuffle=True,
-            random_state=random_state,
-        )
-
-        dt0 = _decision_tree(
-            max_depth=1,
-            random_state=random_state,
-        )
-
-        auc_dt0 = cross_val_score(
-            dt0,
+            print("All variables were pruned. The original features are used instead.")
+        return _fallback_transformer(
             X,
-            y,
-            cv=cv,
-            scoring='roc_auc'
-        ).mean()
+            disc,
+            numeric,
+        )
 
-        for i in range(2, MAX_DEPTH + 1):
-            dt1 = _decision_tree(
-                max_depth=i,
-                random_state=random_state,
-            )
-
-            auc_dt1 = cross_val_score(
-                dt1,
-                X,
-                y,
-                cv=cv,
-                scoring='roc_auc'
-            ).mean()
-
-            if auc_dt1 - auc_dt0 < 0:
-                td = i - 1
-                break
-
-            else:
-                auc_dt0 = auc_dt1
-
-        if verbose:
-            print(f"target_degree = 'adaptive' -> {td}")
-
+    nodes = list(woe_table.columns)
+    if verbose:
+        print(f"Nodes: {len(nodes)}")
+    random_state = check_random_state(random_state)
     mat = _gen_cosine_similarity_matrix(woe_table)
-
-    pcor = _calc_partial_correlations(
+    pcor_values = _calc_partial_correlations(
         mat,
         X.shape[0],
-        td,
-        verbose,
+        gamma=gamma,
+        ebic_threshold=ebic_threshold,
+        verbose=verbose,
+    )
+    pcor = pd.DataFrame(
+        pcor_values,
+        index=nodes,
+        columns=nodes,
     )
 
-    pcor = pd.DataFrame(
-        pcor,
-        columns=woe_table.columns,
+    # Optionally prune a fraction of the weakest EBIC partial-correlation edges.
+    candidate_values = _prune_edges_by_ratio(
+        pcor_values,
+        pruning_ratio,
+    )
+
+    if verbose and pruning_ratio > 0.0:
+        i_prune, j_prune = np.triu_indices(len(pcor_values), k=1)
+        n_before = int(np.count_nonzero(
+            np.abs(pcor_values[i_prune, j_prune]) >= ZERO_TOL
+        ))
+        n_after = int(np.count_nonzero(
+            np.abs(candidate_values[i_prune, j_prune]) >= ZERO_TOL
+        ))
+        print(
+            f"Percentage pruning: ratio={pruning_ratio:.3f}, "
+            f"edges={n_before}->{n_after}"
+        )
+
+    candidate_pcor = pd.DataFrame(
+        candidate_values,
+        index=nodes,
+        columns=nodes,
     )
 
     edges = _get_interaction_terms(
         X_d,
         y,
         weight,
-        pcor,
+        candidate_pcor,
     )
 
-    if min_iv > 0:
-        unnecessary_vars = _filter_variables_with_min_iv(
-            X_d,
-            y,
-            weight,
-            nodes,
-            edges,
-            min_iv,
-            cross_fitting,
-            n_splits,
-            shuffle,
-            random_state,
+    selected_vars = _filter_variables_with_woe(
+        X_d,
+        y,
+        nodes,
+        edges,
+        weight=weight,
+        cross_fitting=cross_fitting,
+        n_splits=n_splits,
+        shuffle=shuffle,
+        random_state=random_state,
+        verbose=verbose,
+    )
+
+    if len(selected_vars) == 0:
+        if verbose:
+            print("All variables were pruned. The original features are used instead.")
+        return _fallback_transformer(
+            X,
+            disc,
+            numeric,
+            pcor=pcor,
         )
 
-        # Remove unnecessary nodes.
-        nodes = [node for node in nodes if node not in unnecessary_vars]
-        if verbose:
-            print(f"Nodes after pruning: {len(nodes)}")
+    # Remove unnecessary edges.
+    edges = {
+        edge_name: edge_nodes
+        for edge_name, edge_nodes in edges.items()
+        if edge_name in selected_vars
+    }
+    if verbose:
+        print(f"Edges after IV pruning: {len(edges)}")
 
-        # Remove unnecessary edges.
-        edges = {
-            edge_name: edge_nodes
-            for edge_name, edge_nodes in edges.items()
-            if edge_name not in unnecessary_vars
-        }
-        if verbose:
-            print(f"Edges after pruning: {len(edges)}")
+    # Keep selected nodes + endpoints of selected edges.
+    edge_nodes = {
+        node
+        for nodes_in_edge in edges.values()
+        for node in nodes_in_edge
+    }
+    nodes = [
+        node
+        for node in nodes
+        if node in selected_vars or node in edge_nodes
+    ]
+    if verbose:
+        print(f"Nodes after IV pruning: {len(nodes)}")
 
-    if len(nodes) == 0 and len(edges) == 0:
-        print("All variables were pruned. The original features are used instead.")
-
-        nc = len(X.columns)
-        pcor = pd.DataFrame(
-            np.zeros((nc, nc)),
-            columns=X.columns,
-        )
-
-        transformer = {
-            'disc': disc,
-            'pcor': pcor,
-            'numeric': numeric,
-            'degree': 0,
-            'nodes': list(X.columns),
-            'edges': {},
-        }
-    else:
-        transformer = {
-            'disc': disc,
-            'pcor': pcor,
-            'numeric': numeric,
-            'degree': td,
-            'nodes': nodes,
-            'edges': edges,
-        }
-
+    transformer = {
+        'disc': disc,
+        'pcor': pcor,
+        'numeric': numeric,
+        'nodes': nodes,
+        'edges': edges,
+    }
     return transformer
 
-def _decision_tree(
-    max_depth,
+
+def _calculate_training_woe(
+    X,
+    y,
+    weight,
+    *,
+    cross_fitting,
+    n_splits,
+    shuffle,
     random_state,
 ):
     """
-    Decision tree implementation for graphical_woe_transformer().
+    Calculate training WoE values.
+
+    Cross-fitted WoE is used when cross_fitting is True.
+    Otherwise, WoE is estimated using the full training dataset.
     """
-    numeric_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
-    categorical_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-        ]
-    )
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, selector(dtype_exclude=("object", "category"))),
-            ("cat", categorical_transformer, selector(dtype_include=("object", "category"))),
-        ]
+    if cross_fitting:
+        return calculate_cross_fitted_woe(
+            X,
+            y,
+            weight,
+            n_splits=n_splits,
+            shuffle=shuffle,
+            random_state=random_state,
+        )
+
+    return calculate_woe(
+        X,
+        y,
+        weight,
     )
 
-    model = DecisionTreeClassifier(
-        max_depth=max_depth,
-        random_state=random_state,
-    )
 
-    pipeline = Pipeline(
-        [
-            ("transformer", preprocessor),
-            ("estimator", model),
-        ]
-    )
+def _fallback_transformer(
+    X,
+    disc,
+    numeric,
+    pcor=None,
+):
+    """
+    Create a fallback transformer using the original features.
 
-    return pipeline
+    Existing EBIC partial correlations are retained when available.
+    The returned model contains no interactions.
+    """
+    return {
+        "disc": disc,
+        "pcor": (
+            pcor if pcor is not None else pd.DataFrame(
+                0.0,
+                index=X.columns,
+                columns=X.columns,
+            )
+        ),
+        "numeric": numeric,
+        "nodes": list(X.columns),
+        "edges": {},
+    }
+
 
 def is_graphical_woe_transformer(
     model,
@@ -518,8 +536,9 @@ def is_graphical_woe_transformer(
     """
     return (
         isinstance(model, dict)
-        and {'disc', 'pcor', 'numeric', 'degree', 'nodes', 'edges'} <= model.keys()
+        and {'disc', 'pcor', 'numeric', 'nodes', 'edges'} <= model.keys()
     )
+
 
 def transform_dataset(
     transformer,
@@ -527,7 +546,6 @@ def transform_dataset(
 ):
     """
     Transform a dataset using a fitted graphical WoE transformer.
-
     The original row index of X is preserved during the transformation.
 
     Args:
@@ -589,6 +607,7 @@ def transform_dataset(
 
     return X_new
 
+
 def _make_categorical_interaction(
     col1,
     col2,
@@ -619,254 +638,10 @@ def _make_categorical_interaction(
 
     return result
 
-def _select_variables_l1_logistic(
-    X_woe,
-    y,
-    weight=None,
-    Cs=None,
-    class_weight=None,
-    max_iter=1000,
-    optimization_tol=1e-3,
-    tol_coef=1e-8,
-    random_state=None,
-):
-    """
-    Select variables using L1-penalized logistic regression and BIC.
 
-    For each candidate C, an L1-penalized logistic regression model is fitted.
-    BIC is calculated from the unpenalized log-likelihood of the fitted model,
-    and the C with the minimum BIC is selected.
-
-    Args:
-      X_woe:
-        DataFrame containing WoE features.
-      y:
-        Binary target variable.
-      weight:
-        Optional one-dimensional array-like of non-negative sample weights.
-      Cs:
-        Candidate inverse regularization strengths.
-        If None, five values logarithmically spaced from 1e-3 to 1e1
-        are used. If an integer, that number of logarithmically spaced
-        values over the same range is used.
-      class_weight:
-        Class weights passed to LogisticRegression.
-      max_iter:
-        Maximum number of solver iterations.
-      optimization_tol:
-        Stopping tolerance used by the optimizer.
-      tol_coef:
-        Coefficient threshold used for variable selection and effective
-        degrees of freedom.
-      random_state:
-        Random state.
-
-    Returns:
-      Dict containing the fitted model, coefficients, selected variables,
-      selected coefficients, selected C, BIC, and the BIC path.
-    """
-    if not isinstance(X_woe, pd.DataFrame):
-        raise TypeError("X_woe must be a pandas DataFrame.")
-
-    if X_woe.shape[1] == 0:
-        raise ValueError("X_woe must contain at least one variable.")
-
-    if not X_woe.columns.is_unique:
-        raise ValueError("X_woe must have unique column names.")
-
-    if not isinstance(tol_coef, (int, float)) or isinstance(tol_coef, bool):
-        raise TypeError("tol_coef must be numeric.")
-
-    if tol_coef < 0:
-        raise ValueError("tol_coef must be non-negative.")
-
-    if (
-        not isinstance(optimization_tol, (int, float))
-        or isinstance(optimization_tol, bool)
-    ):
-        raise TypeError("optimization_tol must be numeric.")
-
-    if optimization_tol <= 0:
-        raise ValueError("optimization_tol must be positive.")
-
-    check_consistent_length(X_woe, y)
-
-    if weight is not None:
-        check_consistent_length(X_woe, weight)
-
-        weight = np.asarray(weight, dtype=np.float64)
-
-        assert weight.ndim == 1, (
-            "weight must be one-dimensional."
-        )
-        assert np.all(np.isfinite(weight)), (
-            "weight must contain only finite values."
-        )
-        assert np.all(weight >= 0), (
-            "weight must contain only non-negative values."
-        )
-        assert np.any(weight > 0), (
-            "At least one sample weight must be positive."
-        )
-
-    # C-contiguous float64 array avoids repeated input conversions.
-    X_values = np.asarray(
-        X_woe.to_numpy(dtype=np.float64, copy=False),
-        order="C",
-    )
-
-    assert np.all(np.isfinite(X_values)), (
-        "X_woe must contain only finite numeric values."
-    )
-
-    y_bool = np.asarray(
-        make_y_bool(y),
-        dtype=bool,
-    )
-
-    if Cs is None:
-        #Cs = np.logspace(-3, 1, 5)
-        Cs = np.logspace(-3, 1, 20)
-
-    elif isinstance(Cs, int):
-        assert Cs >= 1, (
-            "Cs must be a positive integer or a one-dimensional array."
-        )
-
-        Cs = np.logspace(
-            -3,
-            1,
-            Cs,
-        )
-
-    else:
-        Cs = np.asarray(
-            Cs,
-            dtype=np.float64,
-        )
-
-        assert Cs.ndim == 1, (
-            "Cs must be one-dimensional."
-        )
-        assert len(Cs) > 0, (
-            "Cs must contain at least one value."
-        )
-        assert np.all(np.isfinite(Cs)), (
-            "Cs must contain only finite values."
-        )
-        assert np.all(Cs > 0), (
-            "All values in Cs must be positive."
-        )
-
-    # BIC penalty uses the number of observations.
-    if weight is None:
-        n_bic = len(y_bool)
-    else:
-        n_bic = np.sum(weight)
-
-    results = []
-    best_model = None
-    best_bic = np.inf
-
-    for C in Cs:
-        model = LogisticRegression(
-            C=float(C),
-            penalty="l1",
-            solver="saga",
-            class_weight=class_weight,
-            fit_intercept=True,
-            max_iter=max_iter,
-            tol=optimization_tol,
-            random_state=random_state,
-        )
-
-        model.fit(
-            X_values,
-            y_bool,
-            sample_weight=weight,
-        )
-
-        coef_values = model.coef_.ravel()
-
-        # Number of effectively estimated parameters:
-        # non-zero coefficients + intercept.
-        n_nonzero = np.sum(
-            np.abs(coef_values) > tol_coef
-        )
-        n_params = int(n_nonzero + 1)
-
-        # Predicted probability for the positive class.
-        prob = model.predict_proba(X_values)[:, 1]
-
-        # Avoid log(0).
-        eps = np.finfo(np.float64).eps
-
-        prob = np.clip(
-            prob,
-            eps,
-            1.0 - eps,
-        )
-
-        log_likelihood_i = (
-            y_bool * np.log(prob)
-            + (~y_bool) * np.log(1.0 - prob)
-        )
-
-        if weight is None:
-            log_likelihood = np.sum(
-                log_likelihood_i
-            )
-        else:
-            log_likelihood = np.sum(
-                weight * log_likelihood_i
-            )
-
-        bic = (
-            -2.0 * log_likelihood
-            + n_params * np.log(n_bic)
-        )
-
-        results.append(
-            {
-                "C": float(C),
-                "bic": float(bic),
-                "log_likelihood": float(log_likelihood),
-                "n_variables": int(n_nonzero),
-                "n_params": n_params,
-                "n_iter": model.n_iter_.copy(),
-            }
-        )
-
-        if bic < best_bic:
-            best_bic = bic
-            best_model = model
-
-    coef = pd.Series(
-        best_model.coef_.ravel(),
-        index=X_woe.columns,
-        name="coefficient",
-    )
-
-    selected_coef = (
-        coef[coef.abs() > tol_coef]
-        .sort_values(
-            key=np.abs,
-            ascending=False,
-        )
-    )
-
-    bic_path = pd.DataFrame(results)
-
-    return {
-        "model": best_model,
-        "coef": coef,
-        "selected_variables": selected_coef.index.tolist(),
-        "selected_coef": selected_coef,
-        "best_C": float(best_model.C),
-        "best_bic": float(best_bic),
-        "bic_path": bic_path,
-        "n_iter": best_model.n_iter_.copy(),
-    }
+# ============================================================
+# Graph structure estimation
+# ============================================================
 
 def _gen_cosine_similarity_matrix(
     woe_table,
@@ -898,95 +673,96 @@ def _gen_cosine_similarity_matrix(
 
     return mat
 
+
 def _calc_partial_correlations(
     mat,
     n_samples,
-    target_degree,
-    verbose,
+    *,
+    gamma=GAMMA,
+    ebic_threshold=EBIC_THRESHOLD,
+    verbose=False,
 ):
     """
-    Calculate a partial correlation matrix whose graph has approximately
-    the specified average degree.
+    Return the full EBIC estimate; edge selection is a separate step.
 
-    Alpha is selected by logarithmic binary search.
-
-    Args:
-      mat:
-        Square ndarray representing a cosine similarity matrix.
-      n_samples:
-        Number of observations used to calculate mat.
-      target_degree:
-        Target average degree of the estimated graph.
-        If None, full graph is adopted.
-      verbose:
-        Whether to print detailed information.
-
-    Returns:
-      Partial correlation matrix.
+    gamma controls the EBIC complexity penalty used to select the Graphical
+    Lasso alpha. Percentage pruning is intentionally handled by the caller
+    after this estimate has been obtained.
     """
-    assert (
-        isinstance(mat, np.ndarray)
-        and mat.ndim == 2
-        and mat.shape[0] == mat.shape[1]
-        and np.isfinite(mat).all()
-    ), "mat must be a finite square NumPy ndarray."
+    _validate_partial_corr_matrix(mat)
 
-    assert (
-        isinstance(n_samples, (int, np.integer))
-        and not isinstance(n_samples, bool)
-        and n_samples > 0
-    ), "n_samples must be a positive integer."
-
-    assert (
-        target_degree is None
-        or (
-            isinstance(target_degree, (int, np.integer))
-            and not isinstance(target_degree, bool)
-            and target_degree > 0
+    if (
+        not isinstance(n_samples, (int, np.integer))
+        or isinstance(n_samples, (bool, np.bool_))
+        or n_samples <= 0
+    ):
+        raise ValueError(
+            "n_samples must be a positive integer."
         )
-    ), "target_degree must be None or a positive integer."
 
-    assert isinstance(verbose, bool), "verbose must be a boolean."
-
-    p = len(mat)
-
-    if target_degree is not None:
-        target_degree = float(target_degree)
-
-        if target_degree > p - 1:
-            target_degree = float(p - 1)
-
-        if p == 1 or target_degree == 0.0:
-            return np.identity(p)
-
-    best_precision = _calc_partial_correlations_ebic(
-        mat,
-        n_samples,
-        verbose,
+    gamma = _validate_real(
+        gamma,
+        "gamma",
     )
 
-    if target_degree is None:
-        return best_precision
-
-    else:
-        return _select_edges_by_target_degree(
-            best_precision,
-            target_degree,
+    if not isinstance(ebic_threshold, bool):
+        raise TypeError(
+            "ebic_threshold must be a boolean."
         )
+
+    if not isinstance(verbose, bool):
+        raise TypeError(
+            "verbose must be a boolean."
+        )
+
+    if len(mat) == 1:
+        return np.identity(1)
+
+    return _calc_partial_correlations_ebic(
+        mat,
+        n_samples,
+        gamma=gamma,
+        ebic_threshold=ebic_threshold,
+        verbose=verbose,
+    )
+
 
 def _calc_partial_correlations_ebic(
     mat,
     n_samples,
-    verbose,
-    gamma=0.5,
-    alpha_ratios=(0.01, 0.03, 0.1, 0.3, 0.7),
-    edge_threshold=1e-8,
+    *,
+    gamma=GAMMA,
+    alpha_ratios=(0.01, 0.03, 0.1, 0.3, 1.0),
+    n_refine=7,
+    min_alpha_ratio=0.001,
+    ebic_threshold=False,
+    zero_tol=ZERO_TOL,
     max_iter=100,
     tol=1e-3,
+    verbose=False,
 ):
     """
-    Select alpha from a small candidate set using EBIC and calculate
+    Select alpha using a two-stage EBIC search and calculate
     the corresponding partial correlation matrix.
+
+    Optionally, weak off-diagonal precision-matrix elements are
+    removed before EBIC evaluation using
+
+        log(p * (p - 1) / 2) / sqrt(n).
+
+    Stage 1:
+      Evaluate a small set of coarse alpha ratios.
+
+    Stage 2:
+      Refine the search on a logarithmic grid around the best
+      coarse alpha ratio.
+
+      - If the smallest coarse ratio is selected, extend the
+        search downward to min_alpha_ratio.
+      - If the largest coarse ratio (normally 1.0) is selected,
+        no further search is performed because alpha >= alpha_max
+        normally corresponds to an empty graph.
+      - Otherwise, search between the neighboring coarse ratios.
 
     Args:
       mat:
@@ -998,13 +774,23 @@ def _calc_partial_correlations_ebic(
       gamma:
         EBIC high-dimensional penalty parameter.
       alpha_ratios:
-        Candidate alpha values expressed as ratios of alpha_max.
-      edge_threshold:
-        Threshold for treating a precision-matrix element as an edge.
+        Coarse candidate alpha values expressed as ratios of alpha_max.
+      n_refine:
+        Number of logarithmically spaced candidates used in the
+        second-stage local search.
+      min_alpha_ratio:
+        Lower bound used when the smallest coarse alpha ratio
+        is selected in the first stage.
+      ebic_threshold:
+        Whether to threshold weak off-diagonal precision-matrix
+        elements before calculating EBIC.
+      zero_tol:
+        Numerical tolerance for treating a precision-matrix
+        element as zero. This is separate from ebic_threshold.
       max_iter:
         Maximum number of Graphical Lasso iterations.
       tol:
-        Convergence tolerance.
+        Convergence tolerance used by Graphical Lasso.
 
     Returns:
       Partial correlation matrix.
@@ -1021,12 +807,61 @@ def _calc_partial_correlations_ebic(
         and n_samples >= 1
     ), "n_samples must be a positive integer."
 
-    assert isinstance(verbose, bool), "verbose must be a boolean."
+    assert isinstance(verbose, bool), (
+        "verbose must be a boolean."
+    )
 
     assert (
-        isinstance(gamma, (int, float))
+        isinstance(gamma, (int, float, np.integer, np.floating))
+        and not isinstance(gamma, (bool, np.bool_))
+        and np.isfinite(gamma)
         and gamma >= 0.0
-    ), "gamma must be non-negative."
+    ), "gamma must be a finite non-negative number."
+
+    assert isinstance(ebic_threshold, bool), (
+        "ebic_threshold must be a boolean."
+    )
+
+    assert (
+        isinstance(zero_tol, (int, float, np.integer, np.floating))
+        and not isinstance(zero_tol, (bool, np.bool_))
+        and np.isfinite(zero_tol)
+        and zero_tol >= 0.0
+    ), "zero_tol must be a finite non-negative number."
+
+    assert (
+        isinstance(n_refine, (int, np.integer))
+        and not isinstance(n_refine, bool)
+        and n_refine >= 2
+    ), "n_refine must be an integer >= 2."
+
+    assert (
+        isinstance(min_alpha_ratio, (int, float))
+        and not isinstance(min_alpha_ratio, bool)
+        and 0.0 < min_alpha_ratio <= 1.0
+    ), "min_alpha_ratio must be in (0, 1]."
+
+    alpha_ratios = np.asarray(
+        alpha_ratios,
+        dtype=np.float64,
+    )
+
+    if (
+        alpha_ratios.ndim != 1
+        or alpha_ratios.size == 0
+        or not np.isfinite(alpha_ratios).all()
+        or np.any(alpha_ratios <= 0.0)
+        or np.any(alpha_ratios > 1.0)
+    ):
+        raise ValueError(
+            "alpha_ratios must be a one-dimensional sequence "
+            "containing values in (0, 1]."
+        )
+
+    # Sort and remove duplicates.
+    alpha_ratios = np.unique(
+        alpha_ratios
+    )
 
     covariance = np.asarray(
         mat,
@@ -1052,6 +887,28 @@ def _calc_partial_correlations_ebic(
         k=1,
     )
 
+    # ---------------------------------------------------------
+    # EBIC threshold.
+    # ---------------------------------------------------------
+    if ebic_threshold:
+        ebic_threshold_value = (
+            np.log(
+                p * (p - 1) / 2.0
+            )
+            / np.sqrt(n_samples)
+        )
+    else:
+        ebic_threshold_value = 0.0
+
+    if verbose and ebic_threshold:
+        print(
+            "EBIC threshold: "
+            f"{ebic_threshold_value:.6g}"
+        )
+
+    # ---------------------------------------------------------
+    # Maximum Graphical Lasso alpha.
+    # ---------------------------------------------------------
     alpha_max = float(
         np.max(
             np.abs(covariance[iu])
@@ -1061,21 +918,53 @@ def _calc_partial_correlations_ebic(
     if alpha_max <= 0.0:
         return np.identity(p)
 
-    alphas = (
-        alpha_max
-        * np.asarray(
-            alpha_ratios,
-            dtype=np.float64,
-        )
-    )
-
     best_ebic = np.inf
     best_alpha = None
+    best_ratio = None
     best_precision = None
     best_edges = None
     best_degree = None
 
-    for alpha in alphas:
+    # Store evaluated ratios to avoid fitting the same alpha twice.
+    evaluated_ratios = {}
+
+    def count_edges(precision):
+        """
+        Count numerically nonzero off-diagonal precision elements.
+        """
+        return int(
+            np.count_nonzero(
+                np.abs(precision[iu]) > zero_tol
+            )
+        )
+
+    def evaluate_ratio(
+        ratio,
+        stage,
+    ):
+        nonlocal best_ebic
+        nonlocal best_alpha
+        nonlocal best_ratio
+        nonlocal best_precision
+        nonlocal best_edges
+        nonlocal best_degree
+
+        ratio = float(ratio)
+
+        # Avoid duplicate evaluations caused by overlapping grids.
+        for previous_ratio in evaluated_ratios:
+            if np.isclose(
+                ratio,
+                previous_ratio,
+                rtol=1e-12,
+                atol=1e-15,
+            ):
+                return evaluated_ratios[
+                    previous_ratio
+                ]
+
+        alpha = alpha_max * ratio
+
         try:
             _, precision = graphical_lasso(
                 emp_cov=covariance,
@@ -1084,17 +973,78 @@ def _calc_partial_correlations_ebic(
                 tol=tol,
             )
 
-            if not np.isfinite(
-                precision
-            ).all():
-                continue
+            if not np.isfinite(precision).all():
+                evaluated_ratios[ratio] = np.inf
+                return np.inf
 
-            sign, logdet = np.linalg.slogdet(
+            # Ensure numerical symmetry.
+            precision = (
+                precision + precision.T
+            ) / 2.0
+
+            n_edges_before = count_edges(
                 precision
             )
 
-            if sign <= 0:
-                continue
+            # -------------------------------------------------
+            # EBIC thresholding.
+            # -------------------------------------------------
+            if ebic_threshold:
+                precision = precision.copy()
+
+                weak_edges = (
+                    np.abs(precision)
+                    < ebic_threshold_value
+                )
+
+                # Never threshold diagonal elements.
+                np.fill_diagonal(
+                    weak_edges,
+                    False,
+                )
+
+                precision[
+                    weak_edges
+                ] = 0.0
+
+                # Preserve exact symmetry.
+                precision = (
+                    precision + precision.T
+                ) / 2.0
+
+            n_edges = count_edges(
+                precision
+            )
+
+            # -------------------------------------------------
+            # Check positive definiteness and calculate logdet.
+            # -------------------------------------------------
+            try:
+                chol = np.linalg.cholesky(
+                    precision
+                )
+            except np.linalg.LinAlgError:
+                evaluated_ratios[ratio] = np.inf
+
+                if verbose:
+                    print(
+                        f"{stage}: "
+                        f"ratio={ratio:.6g}, "
+                        f"alpha={alpha:.6g} failed: "
+                        "precision matrix is not "
+                        "positive definite."
+                    )
+
+                return np.inf
+
+            logdet = (
+                2.0
+                * np.sum(
+                    np.log(
+                        np.diag(chol)
+                    )
+                )
+            )
 
             # Gaussian log-likelihood excluding constants:
             #
@@ -1108,13 +1058,6 @@ def _calc_partial_correlations_ebic(
                     - np.trace(
                         covariance @ precision
                     )
-                )
-            )
-
-            n_edges = int(
-                np.count_nonzero(
-                    np.abs(precision[iu])
-                    > edge_threshold
                 )
             )
 
@@ -1136,10 +1079,26 @@ def _calc_partial_correlations_ebic(
                 2.0 * n_edges / p
             )
 
+            evaluated_ratios[
+                ratio
+            ] = ebic
+
             if verbose:
+                if ebic_threshold:
+                    edge_text = (
+                        f"edges="
+                        f"{n_edges_before}->{n_edges}"
+                    )
+                else:
+                    edge_text = (
+                        f"edges={n_edges}"
+                    )
+
                 print(
+                    f"{stage}: "
+                    f"ratio={ratio:.6g}, "
                     f"alpha={alpha:.6g}, "
-                    f"edges={n_edges}, "
+                    f"{edge_text}, "
                     f"mean_degree={mean_degree:.3f}, "
                     f"EBIC={ebic:.3f}"
                 )
@@ -1147,15 +1106,111 @@ def _calc_partial_correlations_ebic(
             if ebic < best_ebic:
                 best_ebic = ebic
                 best_alpha = float(alpha)
+                best_ratio = ratio
                 best_precision = precision.copy()
                 best_edges = n_edges
                 best_degree = mean_degree
 
+            return ebic
+
         except Exception as error:
+            evaluated_ratios[
+                ratio
+            ] = np.inf
+
             if verbose:
                 print(
+                    f"{stage}: "
+                    f"ratio={ratio:.6g}, "
                     f"alpha={alpha:.6g} failed: "
                     f"{error}"
+                )
+
+            return np.inf
+
+    # ---------------------------------------------------------
+    # Stage 1: coarse search.
+    # ---------------------------------------------------------
+    if verbose:
+        print(
+            "EBIC coarse search:"
+        )
+
+    coarse_ebics = np.array(
+        [
+            evaluate_ratio(
+                ratio,
+                stage="coarse",
+            )
+            for ratio in alpha_ratios
+        ],
+        dtype=np.float64,
+    )
+
+    finite_mask = np.isfinite(
+        coarse_ebics
+    )
+
+    if not np.any(finite_mask):
+        if verbose:
+            print(
+                "All coarse alpha candidates failed. "
+                "Returning identity."
+            )
+
+        return np.identity(p)
+
+    coarse_best_idx = int(
+        np.nanargmin(
+            coarse_ebics
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Stage 2: local logarithmic refinement.
+    # ---------------------------------------------------------
+    if coarse_best_idx == len(alpha_ratios) - 1:
+        # Largest ratio selected.
+        # Normally ratio=1.0 corresponds to alpha_max and
+        # therefore an empty graph.
+        if verbose:
+            print(
+                "Refinement skipped because the largest "
+                "alpha ratio was selected."
+            )
+
+    else:
+        if coarse_best_idx == 0:
+            lower_ratio = min(
+                min_alpha_ratio,
+                alpha_ratios[0],
+            )
+            upper_ratio = alpha_ratios[1]
+
+        else:
+            lower_ratio = alpha_ratios[
+                coarse_best_idx - 1
+            ]
+            upper_ratio = alpha_ratios[
+                coarse_best_idx + 1
+            ]
+
+        if lower_ratio < upper_ratio:
+            refine_ratios = np.geomspace(
+                lower_ratio,
+                upper_ratio,
+                n_refine,
+            )
+
+            if verbose:
+                print(
+                    "EBIC refinement search:"
+                )
+
+            for ratio in refine_ratios:
+                evaluate_ratio(
+                    ratio,
+                    stage="refine",
                 )
 
     if best_precision is None:
@@ -1170,6 +1225,7 @@ def _calc_partial_correlations_ebic(
     if verbose:
         print(
             "Selected by EBIC: "
+            f"ratio={best_ratio:.6g}, "
             f"alpha={best_alpha:.6g}, "
             f"edges={best_edges}, "
             f"mean_degree={best_degree:.3f}, "
@@ -1180,12 +1236,12 @@ def _calc_partial_correlations_ebic(
         best_precision
     )
 
+
 def _precision_to_partial_corr(
     Theta,
 ):
     """
     Calculate a partial correlation matrix from a precision matrix.
-
     This internal function is used by _calc_partial_correlations().
 
     Args:
@@ -1201,60 +1257,62 @@ def _precision_to_partial_corr(
 
     return rho
 
-def _select_edges_by_target_degree(
-    partial_corr,
-    target_degree,
+
+def _validate_partial_corr_matrix(
+    mat,
 ):
     """
-    Select edges with the largest absolute partial correlations so that
-    the average degree is approximately equal to target_degree.
+    Validate a nonempty finite symmetric square NumPy matrix.
+    """
+    if not isinstance(mat, np.ndarray):
+        raise TypeError("The matrix must be a NumPy ndarray.")
+
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1] or mat.shape[0] == 0:
+        raise ValueError("The matrix must be nonempty and square.")
+
+    if not np.isfinite(mat).all() or not np.allclose(mat, mat.T):
+        raise ValueError("The matrix must be finite and symmetric.")
+
+
+def _prune_edges_by_ratio(
+    partial_corr,
+    pruning_ratio,
+):
+    """
+    Remove a fraction of the weakest nonzero partial-correlation edges.
 
     Args:
       partial_corr:
-        Square partial correlation matrix.
-      target_degree:
-        Target average degree.
+        Symmetric partial correlation matrix.
+      pruning_ratio:
+        Fraction of nonzero edges to remove, in [0, 1).
 
     Returns:
-      Sparse partial correlation matrix.
+      Pruned partial correlation matrix.
     """
-    assert isinstance(partial_corr, np.ndarray), (
-        "partial_corr must be a NumPy ndarray."
-    )
-    assert partial_corr.ndim == 2, (
-        "partial_corr must be two-dimensional."
-    )
-    assert partial_corr.shape[0] == partial_corr.shape[1], (
-        "partial_corr must be square."
-    )
-    assert isinstance(target_degree, (int, float)), (
-        "target_degree must be numeric."
-    )
-    assert 0 <= target_degree <= partial_corr.shape[0] - 1, (
-        "target_degree must be between 0 and n_variables - 1."
-    )
+    _validate_partial_corr_matrix(partial_corr)
+    pruning_ratio = _validate_real(pruning_ratio, "pruning_ratio")
+    if pruning_ratio >= 1.0:
+        raise ValueError("pruning_ratio must be less than 1.0.")
 
-    p = partial_corr.shape[0]
-
-    # Number of edges to retain.
-    n_edges = int(round(target_degree * p / 2))
-
-    # Upper triangular entries.
+    p = len(partial_corr)
     i, j = np.triu_indices(p, k=1)
-    w = np.abs(partial_corr[i, j])
+    strength = np.abs(partial_corr[i, j])
+    candidates = np.flatnonzero(strength >= ZERO_TOL)
 
-    # Indices of largest absolute partial correlations.
-    order = np.argsort(w)[::-1]
+    n_prune = int(np.floor(len(candidates) * pruning_ratio))
+    if n_prune == 0:
+        return partial_corr.copy()
 
-    keep = order[:n_edges]
+    order = candidates[np.argsort(strength[candidates], kind="stable")]
+    prune = order[:n_prune]
 
-    selected = np.zeros_like(partial_corr)
-    selected[i[keep], j[keep]] = partial_corr[i[keep], j[keep]]
-    selected[j[keep], i[keep]] = partial_corr[j[keep], i[keep]]
-
+    selected = partial_corr.copy()
+    selected[i[prune], j[prune]] = 0.0
+    selected[j[prune], i[prune]] = 0.0
     np.fill_diagonal(selected, 1.0)
-
     return selected
+
 
 def _get_interaction_terms(
     X,
@@ -1317,138 +1375,85 @@ def _get_interaction_terms(
     for i, j, wt in links:
         i, j = int(i), int(j)
         inter_name = names[i] + '*' + names[j]
+        if inter_name in X.columns or inter_name in edges:
+            raise ValueError(f"Interaction name collision: {inter_name!r}.")
         edges[inter_name] = [names[i], names[j]]
 
     return edges
 
-def _filter_variables_with_min_iv(
+
+def _filter_variables_with_woe(
     X_d,
     y,
-    weight,
     nodes,
     edges,
-    min_iv,
-    cross_fitting,
-    n_splits,
-    shuffle,
-    random_state,
+    *,
+    weight=None,
+    cross_fitting=True,
+    n_splits=5,
+    shuffle=True,
+    random_state=None,
+    verbose=False,
 ):
     """
-    Identify variables whose information value (IV) is below a threshold.
+    Identify variables to retain based on information value (IV).
 
     This internal function constructs a DataFrame containing the specified
     node and interaction variables, transforms them into Weight of Evidence
-    (WoE) values, and identifies variables with IV values below min_iv.
-
-    This function is used by graphical_woe_transformer().
-
-    Args:
-      X_d:
-        DataFrame containing categorical or discretized variables.
-      y:
-        One-dimensional array-like binary target variable.
-      weight:
-        Optional one-dimensional array-like sample weights.
-      nodes:
-        List of node variable names to include.
-      edges:
-        Dictionary whose keys are interaction variable names and whose
-        values are pairs of node variable names.
-        For example, {"a*b": ["a", "b"]}.
-      min_iv:
-        Minimum IV required to retain a variable.
-      cross_fitting:
-        Whether to calculate WoE using cross-fitting.
-      n_splits:
-        Number of folds used for cross-fitting.
-      shuffle:
-        Whether to shuffle observations before creating folds.
-      random_state:
-        Random seed used when shuffle is True.
-
-    Returns:
-      List of variable names whose IV values are below min_iv.
+    (WoE) values, and retains variables with IV larger than MIN_IV.
     """
     if not isinstance(X_d, pd.DataFrame):
         raise TypeError("X_d must be a pandas DataFrame.")
-
     if not isinstance(nodes, list):
         raise TypeError("nodes must be a list.")
-
     if not isinstance(edges, dict):
         raise TypeError("edges must be a dictionary.")
 
-    if not isinstance(min_iv, (int, float)) or isinstance(min_iv, bool):
-        raise TypeError("min_iv must be numeric.")
-
-    if min_iv < 0:
-        raise ValueError("min_iv must be non-negative.")
-
-    # Construct a new DataFrame containing the node variables.
     X_new = X_d[nodes].copy()
-
-    # Add an interaction variable for each edge.
     for inter_name, edge_nodes in edges.items():
         if not isinstance(edge_nodes, (list, tuple)) or len(edge_nodes) != 2:
             raise ValueError(
                 "Each value in edges must contain exactly two variable names."
             )
-
         name1, name2 = edge_nodes
+        X_new[inter_name] = _make_categorical_interaction(
+            X_d[name1],
+            X_d[name2],
+        ).astype("category")
 
-        col1 = X_d[name1].astype("string")
-        col2 = X_d[name2].astype("string")
-
-        X_new[inter_name] = (
-            (col1 + "*" + col2)
-            .where(col1.notna() & col2.notna())
-            .astype("category")
-        )
-
-    # Calculate WoE values for all node and interaction variables.
-    if cross_fitting:
-        woe_result = calculate_cross_fitted_woe(
-            X_new,
-            y,
-            weight,
-            n_splits=n_splits,
-            shuffle=shuffle,
-            random_state=random_state,
-        )
-    else:
-        woe_result = calculate_woe(
-            X_new,
-            y,
-            weight,
-        )
-
+    woe_result = _calculate_training_woe(
+        X_new,
+        y,
+        weight,
+        cross_fitting=cross_fitting,
+        n_splits=n_splits,
+        shuffle=shuffle,
+        random_state=random_state,
+    )
     woe_table = woe_result["woe_table"]
     y_bool = woe_result["y_bool"]
 
     if not isinstance(woe_table, pd.DataFrame):
         raise TypeError("woe_table must be a pandas DataFrame.")
-
     if not isinstance(y_bool, pd.Series):
         raise TypeError("y_bool must be a pandas Series.")
-
     if y_bool.dtype != bool:
         raise TypeError("y_bool must be a boolean Series.")
+    if not woe_table.index.equals(y_bool.index):
+        raise ValueError("WoE and y_bool indices must be aligned.")
 
-    # Identify variables whose IV values are below the threshold.
-    unnecessary_vars = []
+    iv = woe_table.loc[y_bool].mean() - woe_table.loc[~y_bool].mean()
+    selected_vars = iv.index[iv > MIN_IV].tolist()
 
-    for var in woe_table.columns:
-        woe_vec = woe_table[var]
+    if verbose:
+        print(f"selected variables by IV: {len(selected_vars)}")
 
-        iv = float(
-            woe_vec[y_bool].mean()
-            - woe_vec[~y_bool].mean()
-        )
+    return selected_vars
 
-        if iv < min_iv:
-            unnecessary_vars.append(var)
 
-    return unnecessary_vars
+# ============================================================
+# Graph visualization
+# ============================================================
 
 def gen_graph_data(
     transformer,
@@ -1460,7 +1465,7 @@ def gen_graph_data(
 
     Args:
       transformer:
-        Fitted graphical naive Bayes transformer.
+        Fitted graphical WoE transformer.
 
     Returns:
       NetworkX Graph representing the graphical model.
@@ -1470,39 +1475,32 @@ def gen_graph_data(
             "transformer must be a fitted graphical WoE transformer."
         )
 
-    def _get_flatten(nested_list):
-        return [item for sublist in nested_list for item in sublist]
+    pcor = transformer["pcor"]
+    nodes = transformer["nodes"]
+    edges = transformer["edges"]
 
-    pcor = transformer['pcor']
-    nodes = transformer['nodes']
-    edges = transformer['edges']
-
-    names = list(pcor.columns)
-    pcor = pcor.to_numpy()
+    positions = {name: i for i, name in enumerate(pcor.columns)}
+    values = pcor.to_numpy()
 
     # Initialize the graph.
     G = nx.Graph()
 
     # Add nodes.
-    graph_nodes = list(set(nodes) | set(_get_flatten(edges.values())))
-    for v in graph_nodes:
-        G.add_node(v)
+    G.add_nodes_from(nodes)
 
     # Add edges.
-    for key in edges:
-        v1 = edges[key][0]
-        v2 = edges[key][1]
-        try:
-            i = names.index(v1)
-        except ValueError:
+    for v1, v2 in edges.values():
+        if v1 not in positions or v2 not in positions:
             continue
-        try:
-            j = names.index(v2)
-        except ValueError:
-            continue
-        G.add_edge(v1, v2, weight=pcor[i][j])
+        attributes = {"weight": values[positions[v1], positions[v2]]}
+        G.add_edge(
+            v1,
+            v2,
+            **attributes,
+        )
 
     return G
+
 
 def draw_graphical_model(
     obj,
@@ -1604,6 +1602,7 @@ def draw_graphical_model(
 
     return G, args
 
+
 def _draw_network_graph(
     G,
     pos=None,
@@ -1622,7 +1621,7 @@ def _draw_network_graph(
         NetworkX Graph.
       pos:
         Dictionary specifying node positions.
-        If None, networkx.spring_layout() is used.
+        If None, networkx.kamada_kawai_layout() is used.
       width_scale:
         Positive scale factor applied to edge widths based on the
         absolute partial correlation coefficients.
@@ -1644,7 +1643,8 @@ def _draw_network_graph(
     assert isinstance(G, nx.Graph), "G must be a NetworkX Graph."
 
     if pos is None:
-        pos = nx.spring_layout(G)
+        #pos = nx.spring_layout(G)
+        pos = nx.kamada_kawai_layout(G, weight=None)
 
     args = {'pos': pos, 'with_labels': True, **kwds}
 
@@ -1681,424 +1681,22 @@ def _draw_network_graph(
 
     return args
 
-def make_l1_coefficient_dict(
-    model,
-    prep,
-    X,
-):
-    """
-    Extract L1 logistic regression coefficients grouped by original variables.
-
-    This function is specific to the preprocessing pipeline used in this module
-    and assumes the following preprocessing structure:
-
-      prep: ColumnTransformer
-       ├── "num": numerical transformer
-       └── "cat": Pipeline
-          └── "encoder": OneHotEncoder
-
-    The fitted OneHotEncoder is used to recover the correspondence between
-    original categorical variables and their encoded categories.
-
-    Args:
-      model:
-        Fitted LogisticRegression model.
-      prep:
-        Fitted preprocessing pipeline used to transform X.
-      X:
-        DataFrame before preprocessing.
-
-    Returns:
-      Dict containing numerical and categorical coefficients grouped by
-      original variables.
-    """
-    if not isinstance(X, pd.DataFrame):
-        raise TypeError("X must be a pandas DataFrame.")
-
-    num_features = [
-        col
-        for col in X.columns
-        if X[col].dtype.kind in "iufc"
-    ]
-
-    cat_features = [
-        col
-        for col in X.columns
-        if X[col].dtype.kind not in "iufc"
-    ]
-
-    coef = {
-        "numeric": {},
-        "categorical": {},
-    }
-
-    # Numerical features
-    n_num = len(num_features)
-
-    for i, var in enumerate(num_features):
-        coef["numeric"][var] = float(
-            model.coef_[0][i]
-        )
-
-    # Categorical features
-    if cat_features:
-        ohe = (
-            prep
-            .named_transformers_["cat"]
-            .named_steps["encoder"]
-        )
-
-        offset = n_num
-
-        for var, categories in zip(
-            cat_features,
-            ohe.categories_,
-        ):
-            n_categories = len(categories)
-
-            values = model.coef_[0][
-                offset:offset + n_categories
-            ]
-
-            coef["categorical"][var] = {
-                str(category): float(value)
-                for category, value in zip(
-                    categories,
-                    values,
-                )
-            }
-
-            offset += n_categories
-
-    return coef
-
-def plot_l1_coefficients(
-    coef,
-    variables=None,
-    exclude_zero=True,
-):
-    """
-    Plot L1 logistic regression coefficients by original variable.
-
-    Numerical variables are displayed in one plot. Each categorical
-    variable is displayed in a separate plot.
-
-    Args:
-      coef:
-        Coefficient dictionary generated by make_l1_coefficient_dict().
-      variables:
-        List of original variable names to display.
-        If None, all variables are displayed.
-        Variables that do not exist are ignored.
-      exclude_zero:
-        Whether to exclude zero coefficients.
-    """
-    if not isinstance(coef, dict):
-        raise TypeError("coef must be a dictionary.")
-
-    if variables is not None and not isinstance(variables, list):
-        raise TypeError("variables must be a list or None.")
-
-    if variables is not None:
-        all_variables = (
-            set(coef.get("numeric", {}))
-            | set(coef.get("categorical", {}))
-        )
-
-        if not any(var in all_variables for var in variables):
-            return None
-
-    # Numerical features
-    numeric_coef = coef.get("numeric", {})
-
-    if variables is not None:
-        numeric_coef = {
-            key: value
-            for key, value in numeric_coef.items()
-            if key in variables
-        }
-
-    if exclude_zero:
-        numeric_coef = {
-            key: value
-            for key, value in numeric_coef.items()
-            if value != 0
-        }
-
-    if numeric_coef:
-        plot_data = pd.DataFrame({
-            "feature": list(numeric_coef.keys()),
-            "coefficient": list(numeric_coef.values()),
-        })
-
-        plot_data["abs_coefficient"] = (
-            plot_data["coefficient"].abs()
-        )
-
-        plot_data = plot_data.sort_values(
-            "abs_coefficient",
-            ascending=False,
-        )
-
-        fig, ax = plt.subplots(
-            figsize=(
-                7,
-                max(3, 0.3 * len(plot_data)),
-            )
-        )
-
-        sns.barplot(
-            data=plot_data,
-            x="coefficient",
-            y="feature",
-            order=plot_data["feature"],
-            errorbar=None,
-            ax=ax,
-        )
-
-        ax.axvline(
-            0,
-            linestyle="--",
-            linewidth=1,
-        )
-
-        ax.set(
-            xlabel="Coefficient",
-            ylabel="Numeric features",
-        )
-
-        sns.despine(
-            ax=ax,
-            left=True,
-            bottom=True,
-        )
-
-        fig.tight_layout()
-        plt.show()
-
-    # Categorical features
-    categorical_coef = coef.get(
-        "categorical",
-        {},
-    )
-
-    if variables is not None:
-        categorical_coef = {
-            key: value
-            for key, value in categorical_coef.items()
-            if key in variables
-        }
-
-    for var, categories in categorical_coef.items():
-        if exclude_zero:
-            categories = {
-                key: value
-                for key, value in categories.items()
-                if value != 0
-            }
-
-        if not categories:
-            continue
-
-        plot_data = pd.DataFrame({
-            "category": list(categories.keys()),
-            "coefficient": list(categories.values()),
-        })
-
-        plot_data["abs_coefficient"] = (
-            plot_data["coefficient"].abs()
-        )
-
-        plot_data = plot_data.sort_values(
-            "abs_coefficient",
-            ascending=False,
-        )
-
-        fig, ax = plt.subplots(
-            figsize=(
-                7,
-                max(3, 0.3 * len(plot_data)),
-            )
-        )
-
-        sns.barplot(
-            data=plot_data,
-            x="coefficient",
-            y="category",
-            order=plot_data["category"],
-            errorbar=None,
-            ax=ax,
-        )
-
-        ax.axvline(
-            0,
-            linestyle="--",
-            linewidth=1,
-        )
-
-        ax.set(
-            xlabel="Coefficient",
-            ylabel=var,
-        )
-
-        sns.despine(
-            ax=ax,
-            left=True,
-            bottom=True,
-        )
-
-        fig.tight_layout()
-        plt.show()
-
-def plot_l1_feature_coefficients(
-    coefficients,
-    feature_names,
-    top_n=None,
-    exclude_zero=True,
-):
-    """
-    Plot L1 logistic regression coefficients by transformed feature.
-
-    Features are ordered by absolute coefficient magnitude.
-
-    Args:
-      coefficients:
-        One-dimensional array-like coefficients.
-      feature_names:
-        One-dimensional array-like feature names corresponding to
-        coefficients.
-      top_n:
-        Number of features to display, selected by absolute coefficient
-        magnitude. If None, all features are displayed.
-      exclude_zero:
-        Whether to exclude features with zero coefficients.
-
-    Returns:
-      DataFrame containing the displayed features and coefficients.
-    """
-    coefficients = np.asarray(coefficients)
-    feature_names = np.asarray(feature_names)
-
-    if coefficients.ndim != 1:
-        raise ValueError(
-            "coefficients must be one-dimensional."
-        )
-
-    if feature_names.ndim != 1:
-        raise ValueError(
-            "feature_names must be one-dimensional."
-        )
-
-    if len(coefficients) != len(feature_names):
-        raise ValueError(
-            "coefficients and feature_names must have the same length."
-        )
-
-    if top_n is not None:
-        if not isinstance(top_n, int) or isinstance(top_n, bool):
-            raise TypeError(
-                "top_n must be an integer or None."
-            )
-
-        if top_n <= 0:
-            raise ValueError(
-                "top_n must be positive."
-            )
-
-    if not isinstance(exclude_zero, bool):
-        raise TypeError(
-            "exclude_zero must be a boolean."
-        )
-
-    plot_data = pd.DataFrame({
-        "feature": feature_names,
-        "coefficient": coefficients,
-    })
-
-    if exclude_zero:
-        plot_data = plot_data[
-            plot_data["coefficient"] != 0
-        ]
-
-    plot_data["abs_coefficient"] = (
-        plot_data["coefficient"].abs()
-    )
-
-    plot_data = plot_data.sort_values(
-        "abs_coefficient",
-        ascending=False,
-    )
-
-    if top_n is not None:
-        plot_data = plot_data.head(top_n)
-
-    if plot_data.empty:
-        return (
-            plot_data
-            .drop(columns="abs_coefficient")
-            .reset_index(drop=True)
-        )
-
-    fig, ax = plt.subplots(
-        figsize=(
-            7,
-            max(3, 0.3 * len(plot_data)),
-        )
-    )
-
-    sns.barplot(
-        data=plot_data,
-        x="coefficient",
-        y="feature",
-        order=plot_data["feature"],
-        errorbar=None,
-        ax=ax,
-    )
-
-    ax.axvline(
-        0,
-        linestyle="--",
-        linewidth=1,
-    )
-
-    ax.set(
-        xlabel="Coefficient",
-        ylabel=None,
-    )
-
-    sns.despine(
-        ax=ax,
-        left=True,
-        bottom=True,
-    )
-
-    fig.tight_layout()
-    plt.show()
-
-    return (
-        plot_data
-        .drop(columns="abs_coefficient")
-        .reset_index(drop=True)
-    )
 
 """
 scikit-learn compliant class that provides methods for graphical WoE transformer.
 """
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils.validation import check_is_fitted
-from sklearn.exceptions import NotFittedError
-
 class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
 
     def __init__(
         self,
+        *,
         discretizer='bic',
         cross_fitting=True,
         n_splits=5,
         shuffle=True,
-        l1_selection=False,
-        target_degree='adaptive',
-        min_iv=MIN_IV,
+        gamma=GAMMA,
+        ebic_threshold=EBIC_THRESHOLD,
+        pruning_ratio=PRUNING_RATIO,
         numeric=True,
         random_state=None,
         verbose=False,
@@ -2107,9 +1705,9 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         self.cross_fitting = cross_fitting
         self.n_splits = n_splits
         self.shuffle = shuffle
-        self.l1_selection = l1_selection
-        self.target_degree = target_degree
-        self.min_iv = min_iv
+        self.gamma = gamma
+        self.ebic_threshold = ebic_threshold
+        self.pruning_ratio = pruning_ratio
         self.numeric = numeric
         self.random_state = random_state
         self.verbose = verbose
@@ -2129,8 +1727,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         weight=None,
     ):
         ycat = pd.Categorical(y)
-        self.classes_ = np.array(ycat.categories)
-        self.coef_ = graphical_woe_transformer(
+        fitted = graphical_woe_transformer(
             X,
             y,
             weight=weight,
@@ -2138,12 +1735,19 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
             cross_fitting=self.cross_fitting,
             n_splits=self.n_splits,
             shuffle=self.shuffle,
-            l1_selection=self.l1_selection,
-            target_degree=self.target_degree,
-            min_iv=self.min_iv,
+            gamma=self.gamma,
+            ebic_threshold=self.ebic_threshold,
+            pruning_ratio=self.pruning_ratio,
             numeric=self.numeric,
             random_state=self.random_state,
-            verbose=self.verbose
+            verbose=self.verbose,
+        )
+        self.coef_ = fitted
+        self.classes_ = np.array(ycat.categories)
+        self.n_features_in_ = X.shape[1]
+        self.feature_names_in_ = np.asarray(
+            X.columns,
+            dtype=object,
         )
         return self
 
@@ -2151,10 +1755,10 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         self,
         X,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The transformer is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return transform_dataset(
             self.coef_,
@@ -2164,10 +1768,10 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
     def gen_graph_data(
         self,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return gen_graph_data(self.coef_)
 
@@ -2178,12 +1782,12 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         width_scale=None,
         node_color=None,
         edge_colors=None,
-        **kwds
+        **kwds,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         if G is None:
             return draw_graphical_model(
@@ -2192,7 +1796,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
                 width_scale=width_scale,
                 node_color=node_color,
                 edge_colors=edge_colors,
-                **kwds
+                **kwds,
             )
 
         else:
@@ -2203,26 +1807,50 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
                 width_scale=width_scale,
                 node_color=node_color,
                 edge_colors=edge_colors,
-                **kwds
+                **kwds,
             )
 
     def get_transformer(
         self,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return self.coef_
 
     def get_pcor(
         self,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return self.coef_['pcor']
+
+    def get_feature_names_out(
+        self,
+        input_features=None,
+    ):
+        """
+        Return output names in the same order as transform().
+        """
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'feature_names_in_'],
+        )
+        if input_features is not None and not np.array_equal(
+            np.asarray(
+                input_features,
+                dtype=object,
+            ),
+            self.feature_names_in_,
+        ):
+            raise ValueError("input_features must match the fitted column names.")
+        return np.asarray(
+            self.coef_['nodes'] + list(self.coef_['edges']),
+            dtype=object,
+        )
 

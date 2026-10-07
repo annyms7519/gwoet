@@ -10,8 +10,10 @@ gwoet/
 ├── __init__.py
 ├── dnb.py
 │   └── Functions and classes for Discrete Naive Bayes (DNB)
-└── gwoet.py
-    └── Functions and classes for Graphical WoE Transformer (GWoET)
+├── gwoet.py
+│   └── Functions and classes for Graphical WoE Transformer (GWoET)
+└── selection.py
+     └── Functions for logistic feature selection and diagnostics
 """
 
 from .dnb import (
@@ -34,10 +36,14 @@ from .gwoet import (
     gen_graph_data,
     graphical_woe_transformer,
     is_graphical_woe_transformer,
-    make_l1_coefficient_dict,
-    plot_l1_coefficients,
-    plot_l1_feature_coefficients,
     transform_dataset,
+)
+from .selection import (
+    L1LogisticSelector,
+    select_variables_l1_logistic,
+    make_logistic_coefficient_dict,
+    plot_logistic_coefficients,
+    plot_logistic_feature_coefficients,
 )
 
 __version__ = "0.9.0"
@@ -66,8 +72,11 @@ __all__ = [
     "transform_dataset",
     "gen_graph_data",
     "draw_graphical_model",
-    "make_l1_coefficient_dict",
-    "plot_l1_coefficients",
-    "plot_l1_feature_coefficients",
-]
 
+    # Logistic Feature Selection and Diagnostics
+    "L1LogisticSelector",
+    "select_variables_l1_logistic",
+    "make_logistic_coefficient_dict",
+    "plot_logistic_coefficients",
+    "plot_logistic_feature_coefficients",
+]

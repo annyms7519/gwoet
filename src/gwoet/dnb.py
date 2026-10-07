@@ -106,21 +106,26 @@ dnb = obj.get_model()
 
 Author: annyms7519
 Created: 2024-07-05
-Last Modified: 2026-08-15
-Version: 0.9.0
+Last Modified: 2026-10-07
+Version: 0.9.0.5
 License: MIT
 
 """
 import matplotlib.pyplot as plt
+from numba import njit
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.utils.validation import check_is_fitted
 
+# constants
 LAPLACE = 1          # Default Laplace smoothing constant.
 MAX_BIC = 0          # BIC threshold for discretizing numerical variables.
 LOGI_MAX_ITER = 50   # Maximum number of iterations for logistic calibration.
+
 
 def discrete_naive_bayes(
     X,
@@ -225,6 +230,7 @@ def discrete_naive_bayes(
 
     return model
 
+
 def discrete_naive_bayes_main(
     X,
     y,
@@ -278,16 +284,16 @@ def discrete_naive_bayes_main(
           Series containing the validation-fold number assigned to each observation,
           if cross_fitting=True.
         raw_score:
-          Sum of WoE values for each observation, if logi=True.
+          Sum of WoE values across variables for each observation.
         probability:
-          Probability estimates calculated as 1 / (1 + exp(-(c0 + c1 * raw_score))),
-          if logi=True.
+          Calibrated probability estimates obtained by applying logistic
+          calibration to raw_score.
         c0:
-          Logistic calibration intercept, if logi=True.
+          Intercept of the logistic calibration model.
         c1:
-          Logistic calibration coefficient, if logi=True.
+          Coefficient of raw_score in the logistic calibration model.
         iter:
-          Number of logistic calibration iterations, if logi=True.
+          Number of iterations used for logistic calibration.
     """
     y_bool = make_y_bool(
         y,
@@ -335,6 +341,7 @@ def discrete_naive_bayes_main(
         **logistic_result,
     }
 
+
 def is_discrete_naive_bayes(
     model,
 ):
@@ -345,6 +352,7 @@ def is_discrete_naive_bayes(
         isinstance(model, dict)
         and {'disc', 'train'} <= model.keys()
     )
+
 
 def predict_dnb(
     model,
@@ -418,6 +426,7 @@ def predict_dnb(
         "probability": probability,
     }
 
+
 def make_y_bool(
     y,
     index=None,
@@ -472,6 +481,7 @@ def make_y_bool(
         dtype=bool,
     )
 
+
 def make_sample_weight(
     weight,
     n_samples,
@@ -524,6 +534,7 @@ def make_sample_weight(
         )
 
     return weight.copy()
+
 
 def generate_disc(
     X,
@@ -581,7 +592,6 @@ def generate_disc(
         "discretizer must be 'bic' or 'mdlp'."
     )
 
-from numba import njit
 
 @njit(cache=True)
 def _bic_2x2(tab11, tab12, tab21, tab22):
@@ -828,7 +838,6 @@ def _generate_disc_bic_fast(
 
     return disc
 
-from numba import njit
 
 @njit(cache=True, inline="always")
 def _binary_entropy(weight0, weight1):
@@ -1277,6 +1286,7 @@ def _generate_disc_mdlp_fast(
 
     return disc
 
+
 def apply_disc(
     disc,
     X,
@@ -1339,6 +1349,7 @@ def apply_disc(
         index=X.index,
     )
 
+
 def calculate_woe(
     X,
     y,
@@ -1394,7 +1405,6 @@ def calculate_woe(
         **woe_result,
     }
 
-from numba import njit
 
 @njit(cache=True)
 def _aggregate_woe_numba(
@@ -1585,6 +1595,7 @@ def _calculate_woe_main_fast(
         "woe_table": woe_table,
     }
 
+
 def apply_woe(
     X,
     woe,
@@ -1660,6 +1671,7 @@ def apply_woe(
         index=X.index,
         columns=X.columns,
     )
+
 
 def calculate_cross_fitted_woe(
     X,
@@ -1738,6 +1750,7 @@ def calculate_cross_fitted_woe(
         "y_bool": y_bool,
         **result,
     }
+
 
 def _calculate_cross_fitted_woe_main(
     X,
@@ -1870,6 +1883,7 @@ def _calculate_cross_fitted_woe_main(
         "fold": fold_series,
     }
 
+
 def _logistic_regression(
     raw,
     y_bool,
@@ -1964,6 +1978,7 @@ def _logistic_regression(
 
     return res
 
+
 def _calc_probability(
     c0,
     c1,
@@ -1994,6 +2009,7 @@ def _calc_probability(
     p = 1 / (1 + np.exp(-(c0 + c1 * raw)))
 
     return p
+
 
 def get_accuracy_score(
     model,
@@ -2045,6 +2061,7 @@ def get_accuracy_score(
 
     return acc
 
+
 def get_iv(
     model,
     variables=None,
@@ -2077,17 +2094,18 @@ def get_iv(
     y_bool = train['y_bool']
 
     if variables is None:
-        variables = train['woe'].keys()
+        variables = train['woe']
 
     iv = {}
     for var in variables:
-        if var in train['woe'].keys():
+        if var in train['woe']:
             woe_vec = train['woe_table'][var]
             iv[var] = float(np.mean(woe_vec[y_bool]) - np.mean(woe_vec[~y_bool]))
         else:
             iv[var] = None
 
     return iv
+
 
 def plot_iv(
     iv,
@@ -2140,6 +2158,7 @@ def plot_iv(
     fig.tight_layout()
     plt.show()
 
+
 def plot_woe(
     model,
     variables=None,
@@ -2173,7 +2192,6 @@ def plot_woe(
         model,
         var,
     ):
-        disc = model["disc"]
         train = model["train"]
         y_bool = train["y_bool"]
         key_cnt = train["count"][var]
@@ -2229,25 +2247,20 @@ def plot_woe(
 
         return iv
 
-
     if variables is None:
-        all_variables = model['train']['woe'].keys()
-        iv_list = [plot_woe_main(model, var) for var in all_variables]
-        ivs = dict(zip(all_variables, iv_list))
+        variables = list(model["train"]["woe"])
 
-    else:
-        iv_list = [plot_woe_main(model, var) for var in variables]
-        ivs = dict(zip(variables, iv_list))
+    iv_list = [
+        plot_woe_main(model, var)
+        for var in variables
+    ]
 
-    return ivs
+    return dict(zip(variables, iv_list))
+
 
 """
 scikit-learn compliant class that provides methods for discrete naive Bayes.
 """
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.utils.validation import check_is_fitted
-from sklearn.exceptions import NotFittedError
-
 class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
 
     def __init__(
@@ -2278,9 +2291,7 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
         y,
         weight=None,
     ):
-        ycat = pd.Categorical(y)
-        self.classes_ = np.array(ycat.categories)
-        self.coef_ = discrete_naive_bayes(
+        model = discrete_naive_bayes(
             X,
             y,
             weight=weight,
@@ -2290,28 +2301,39 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
             shuffle=self.shuffle,
             random_state=self.random_state,
         )
+
+        # Use the same observed category order as make_y_bool().
+        ycat = pd.Categorical(np.asarray(y))
+        self.classes_ = np.array(ycat.categories)
+        self.coef_ = model
+
         return self
 
     def predict(
         self,
         X,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
-        pred = predict_dnb(self.coef_, X)
-        return (pred['probability'] >= 0.5)
+        pred = predict_dnb(
+            self.coef_,
+            X,
+        )
+        class_index = (pred['probability'] >= 0.5).astype(int)
+
+        return self.classes_[class_index]
 
     def predict_proba(
         self,
         X,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         pred = predict_dnb(self.coef_, X)
         p = pred['probability']
@@ -2322,10 +2344,10 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
         X,
         y,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return get_accuracy_score(
             self.coef_,
@@ -2337,10 +2359,10 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
         self,
         variables=None,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return get_iv(
             self.coef_,
@@ -2351,10 +2373,10 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
         self,
         variables=None,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         iv = get_iv(
             self.coef_,
@@ -2367,10 +2389,10 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
         self,
         variables=None,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return plot_woe(
             self.coef_,
@@ -2380,10 +2402,10 @@ class DiscreteNaiveBayes(BaseEstimator, ClassifierMixin):
     def get_model(
         self,
     ):
-        try:
-            check_is_fitted(self, attributes=['coef_', 'classes_'])
-        except NotFittedError as exc:
-            print(f"The model is not fitted yet.")
+        check_is_fitted(
+            self,
+            attributes=['coef_', 'classes_'],
+        )
 
         return self.coef_
 

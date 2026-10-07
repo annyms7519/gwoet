@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gwoet"
 version = "0.9.0"
-description = "Discrete Naive Bayes (DNB) and Graphical WoE Transformer (GWoET)"
+description = "Discrete Naive Bayes (DNB), Graphical WoE Transformer (GWoET), and logistic feature-selection tools"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -18,6 +18,8 @@ keywords = [
     "naive-bayes",
     "weight-of-evidence",
     "feature-engineering",
+    "feature-selection",
+    "logistic-regression",
     "interpretable-machine-learning",
 ]
 classifiers = [
@@ -36,13 +38,18 @@ dependencies = [
     "networkx",
     "numpy",
     "pandas",
-    "scipy",
     "scikit-learn",
+    "scipy",
     "seaborn",
 ]
 
-[project.urls]
-# Uncomment and update these URLs after creating the repository.
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+# Add project URLs here after the public repository URL is finalized.
+# [project.urls]
 # Homepage = "https://github.com/annyms7519/gnbt"
 # Repository = "https://github.com/annyms7519/gnbt"
 # Issues = "https://github.com/annyms7519/gnbt/issues"
@@ -50,3 +57,7 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["gwoet*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
