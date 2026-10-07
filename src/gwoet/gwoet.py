@@ -1677,7 +1677,6 @@ def _draw_network_graph(
                 args['edge_color'] = edge_colors[0]
 
     nx.draw_networkx(G, **args)
-    plt.show()
 
     return args
 
