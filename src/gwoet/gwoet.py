@@ -114,7 +114,7 @@ else:
 
 
 # constants
-GAMMA = 1.0             # EBIC high-dimensional penalty parameter.
+GAMMA = 0.5             # EBIC high-dimensional penalty parameter.
 EBIC_THRESHOLD = False  # Whether to threshold weak precision-matrix elements.
 PRUNING_RATIO = 0.0     # Fraction of weakest partial-correlation edges to prune.
 ZERO_TOL = 1e-8         # Numerical tolerance for zero precision entries.
