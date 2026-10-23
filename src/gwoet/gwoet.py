@@ -76,13 +76,12 @@ gwoet = tfm.get_transformer()
 pcor = tfm.get_pcor()
 
 
-Author: annyms7519
+Author: Toshiki Mori
 Created: 2024-07-05
-Last modified: 2026-10-07
-Version: 0.9.0.5
+Last modified: 2026-10-22
+Version: 0.9.0.6
 License: MIT
 """
-
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
@@ -114,11 +113,12 @@ else:
 
 
 # constants
-GAMMA = 0.5             # EBIC high-dimensional penalty parameter.
-EBIC_THRESHOLD = False  # Whether to threshold weak precision-matrix elements.
-PRUNING_RATIO = 0.0     # Fraction of weakest partial-correlation edges to prune.
-ZERO_TOL = 1e-8         # Numerical tolerance for zero precision entries.
-MIN_IV = 0.02           # Minimum IV used for variable pruning.
+STRUCTURE_METHOD = "within_class"  # "within_class" or "cosine".
+GAMMA = 1.0                        # EBIC high-dimensional penalty parameter.
+EBIC_THRESHOLD = False             # Whether to threshold weak precision-matrix elements.
+PRUNING_RATIO = 0.0                # Fraction of weakest partial-correlation edges to prune.
+ZERO_TOL = 1e-8                    # Numerical tolerance for zero precision entries.
+MIN_IV = 0.02                      # Minimum IV used for variable pruning.
 
 
 def _validate_real(
@@ -177,6 +177,7 @@ def graphical_woe_transformer(
     cross_fitting=True,
     n_splits=5,
     shuffle=True,
+    structure_method=STRUCTURE_METHOD,
     gamma=GAMMA,
     ebic_threshold=EBIC_THRESHOLD,
     pruning_ratio=PRUNING_RATIO,
@@ -211,6 +212,10 @@ def graphical_woe_transformer(
         Whether to shuffle observations before constructing the
         cross-fitting folds. This argument is used only when
         cross_fitting is True.
+      structure_method:
+        "within_class" (default) estimates the correlation matrix of
+        class-centered WoE residuals; "cosine" reproduces the original
+        WoE cosine-similarity method. The target is never a matrix column.
       gamma:
         Non-negative EBIC high-dimensional penalty parameter used when
         selecting the Graphical Lasso regularization strength. Larger values
@@ -237,9 +242,12 @@ def graphical_woe_transformer(
         pcor:
           Full EBIC-estimated partial correlation matrix, before percentage
           pruning or IV pruning. Zero-norm WoE variables are excluded from
-          estimation. This matrix may contain variables/edges absent from
-          the final nodes/edges. If no WoE variable is estimable, a zero
-          placeholder matrix is returned with the original-feature fallback.
+          estimation. For within_class, variables with zero within-class
+          variance remain as isolated nodes (diagonal 1, edges 0), so
+          they can still contribute main effects. This matrix may
+          contain variables/edges absent from the final nodes/edges.
+          If all original WoE vectors have zero norm, the original-feature
+          fallback returns a zero placeholder matrix.
         numeric:
           Whether numerical variables are kept as numerical variables.
         nodes:
@@ -295,6 +303,11 @@ def graphical_woe_transformer(
     )
     if pruning_ratio >= 1.0:
         raise ValueError("pruning_ratio must be less than 1.0.")
+
+    if structure_method not in ("within_class", "cosine"):
+        raise ValueError(
+            "structure_method must be 'within_class' or 'cosine'."
+        )
 
     if not isinstance(numeric, bool):
         raise TypeError("numeric must be a boolean.")
@@ -367,14 +380,40 @@ def graphical_woe_transformer(
     if verbose:
         print(f"Nodes: {len(nodes)}")
     random_state = check_random_state(random_state)
-    mat = _gen_cosine_similarity_matrix(woe_table)
-    pcor_values = _calc_partial_correlations(
-        mat,
-        X.shape[0],
-        gamma=gamma,
-        ebic_threshold=ebic_threshold,
-        verbose=verbose,
-    )
+    if structure_method == "cosine":
+        # Preserve the original GWoET structure-estimation path.
+        mat = _gen_cosine_similarity_matrix(woe_table)
+        pcor_values = _calc_partial_correlations(
+            mat,
+            X.shape[0],
+            gamma=gamma,
+            ebic_threshold=ebic_threshold,
+            verbose=verbose,
+        )
+    else:
+        # Remove class-specific means (the linear effect of Y) before
+        # learning the X-X precision matrix. No Y column is added.
+        mat, valid = _gen_within_class_similarity_matrix(
+            woe_table, y, weight=weight
+        )
+        # A zero-residual-variance column is not graph-estimable,
+        # but it may still be informative as a main-effect feature.
+        pcor_values = np.eye(len(nodes), dtype=float)
+        valid_idx = np.flatnonzero(valid)
+        if len(valid_idx) > 0:
+            selected_pcor = _calc_partial_correlations(
+                mat,
+                X.shape[0],
+                gamma=gamma,
+                ebic_threshold=ebic_threshold,
+                verbose=verbose,
+            )
+            pcor_values[np.ix_(valid_idx, valid_idx)] = selected_pcor
+        if verbose:
+            print(
+                "Within-class structure: "
+                f"{len(valid_idx)}/{len(nodes)} estimable features"
+            )
     pcor = pd.DataFrame(
         pcor_values,
         index=nodes,
@@ -673,6 +712,68 @@ def _gen_cosine_similarity_matrix(
     np.fill_diagonal(mat, 1.0)
 
     return mat
+
+
+
+def _gen_within_class_similarity_matrix(woe_table, y, weight=None):
+    """Return weighted class-centered WoE correlation and estimable columns.
+
+    Let A_i = Z_i - E_w[Z | Y=y_i]. The returned matrix is the
+    correlation of A columns; class labels are not included as a column.
+
+    Columns with zero within-class variation are excluded from the returned
+    matrix but identified by a Boolean mask. The caller preserves these
+    features for main-effect selection while forbidding incident graph edges.
+
+    When weight is None, all samples receive equal weight.
+    """
+    if not isinstance(woe_table, pd.DataFrame):
+        raise TypeError("woe_table must be a pandas DataFrame.")
+
+    Z = woe_table.to_numpy(dtype=float, copy=True)
+    y = np.asarray(y)
+    if y.ndim != 1 or len(y) != len(Z):
+        raise ValueError("y must be a one-dimensional array aligned with woe_table.")
+    if not np.isfinite(Z).all():
+        raise ValueError("woe_table must contain finite values.")
+
+    if weight is None:
+        w = np.ones(len(y), dtype=float)
+    else:
+        w = np.asarray(weight, dtype=float)
+        if w.ndim != 1 or len(w) != len(y):
+            raise ValueError("weight must be a vector aligned with y.")
+        if not np.isfinite(w).all() or np.any(w < 0.0):
+            raise ValueError("weight must be finite and nonnegative.")
+
+    total = w.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("weight must have positive total weight.")
+    w = w / total
+
+    A = Z.copy()
+    for k in pd.unique(y):
+        mask = y == k
+        mass = w[mask].sum()
+        if mass <= 0.0:
+            raise ValueError("Each class must have positive total weight.")
+        A[mask] -= np.average(Z[mask], axis=0, weights=w[mask])
+
+    # Weighted Gram matrix of residuals: positive semidefinite by construction.
+    WA = A * np.sqrt(w)[:, None]
+    d = np.linalg.norm(WA, axis=0)
+    # Relative tolerance avoids artificial graph nodes due to cancellation.
+    scale = np.maximum(np.max(np.abs(Z), axis=0), 1e-12)
+    valid = d > 1e-12 * scale
+
+    if not np.any(valid):
+        return np.empty((0, 0), dtype=float), valid
+
+    V = WA[:, valid] / d[valid]
+    mat = V.T @ V
+    mat = (mat + mat.T) / 2.0
+    np.fill_diagonal(mat, 1.0)
+    return mat, valid
 
 
 def _calc_partial_correlations(
@@ -1695,6 +1796,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         cross_fitting=True,
         n_splits=5,
         shuffle=True,
+        structure_method=STRUCTURE_METHOD,
         gamma=GAMMA,
         ebic_threshold=EBIC_THRESHOLD,
         pruning_ratio=PRUNING_RATIO,
@@ -1706,6 +1808,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         self.cross_fitting = cross_fitting
         self.n_splits = n_splits
         self.shuffle = shuffle
+        self.structure_method = structure_method
         self.gamma = gamma
         self.ebic_threshold = ebic_threshold
         self.pruning_ratio = pruning_ratio
@@ -1736,6 +1839,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
             cross_fitting=self.cross_fitting,
             n_splits=self.n_splits,
             shuffle=self.shuffle,
+            structure_method=self.structure_method,
             gamma=self.gamma,
             ebic_threshold=self.ebic_threshold,
             pruning_ratio=self.pruning_ratio,
@@ -1854,4 +1958,3 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
             self.coef_['nodes'] + list(self.coef_['edges']),
             dtype=object,
         )
-
