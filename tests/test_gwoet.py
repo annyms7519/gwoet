@@ -16,6 +16,7 @@ import pytest
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
+
 from gwoet import (
     GraphicalWoETransformer,
     graphical_woe_transformer,
@@ -275,7 +276,6 @@ def test_pipeline_wiring(cross_fitting, ebic_threshold, pruning_ratio):
     )
 
     cloned = clone(tfm)
-    assert cloned.structure_method == tfm.structure_method
     assert cloned.gamma == tfm.gamma
     assert cloned.ebic_threshold == tfm.ebic_threshold
     assert cloned.pruning_ratio == tfm.pruning_ratio
@@ -372,7 +372,6 @@ def test_endpoint_retention_after_iv_pruning(monkeypatch):
     model = graphical_woe_transformer(
         X,
         [0, 1, 0, 1],
-        structure_method="cosine",
         pruning_ratio=0.0,
     )
 
@@ -448,13 +447,9 @@ def graph_wiring(monkeypatch, dense_pcor):
             np.asarray(y) == np.unique(y)[-1],
             index=X.index,
         )
-        rng = np.random.RandomState(13)
         values = np.tile(
             np.where(y_bool, 1.0, -1.0)[:, None],
             (1, len(X.columns)),
-        )
-        values += rng.normal(
-            0, 0.1, size=values.shape
         )
         return {
             "woe_table": pd.DataFrame(values, index=X.index, columns=X.columns),
@@ -591,10 +586,9 @@ def test_defaults_use_full_ebic_without_percentage_pruning(
     )
 
     tfm = GraphicalWoETransformer()
-    assert tfm.structure_method == g.STRUCTURE_METHOD
+    assert tfm.pruning_ratio == pytest.approx(g.PRUNING_RATIO)
     assert tfm.gamma == g.GAMMA
     assert tfm.ebic_threshold is g.EBIC_THRESHOLD
-    assert tfm.pruning_ratio == pytest.approx(g.PRUNING_RATIO)
 
     tfm.fit(X, y)
 
@@ -641,134 +635,3 @@ def test_five_key_model_can_be_used_directly():
 
     assert list(transformed) == model["nodes"] + list(model["edges"])
     assert transformed.index.equals(X.index)
-
-
-def test_within_class_matches_manual_unweighted_residual_correlation():
-    rng = np.random.default_rng(24)
-    y = np.repeat([0, 1], 30)
-    z = rng.normal(size=(60, 3)) + y[:, None] * np.array([3, -2, 0.5])
-    original = z.copy()
-    mat, valid = g._gen_within_class_similarity_matrix(pd.DataFrame(z), y)
-    a = z.copy()
-    for k in [0, 1]:
-        a[y == k] -= a[y == k].mean(axis=0)
-    np.testing.assert_allclose(mat, np.corrcoef(a, rowvar=False), atol=1e-12)
-    np.testing.assert_array_equal(valid, np.ones(3, dtype=bool))
-    np.testing.assert_array_equal(z, original)
-
-
-def test_weighted_within_class_means_and_correlations():
-    z = np.array([
-        [1, 2], [2, 3], [0, 4],
-        [4, 3], [5, 1], [7, 0],
-    ], dtype=float)
-    y = np.array(['a', 'a', 'a', 'b', 'b', 'b'])
-    w = np.array([1, 2, 4, 1, 3, 2], dtype=float)
-    mat, valid = g._gen_within_class_similarity_matrix(pd.DataFrame(z), y, w)
-    a = z.copy()
-    for k in ['a', 'b']:
-        sel = y == k
-        a[sel] -= np.average(z[sel], axis=0, weights=w[sel])
-    m = a.T @ (w[:, None] * a)
-    expected = m / np.sqrt(np.outer(np.diag(m), np.diag(m)))
-    np.testing.assert_allclose(mat, expected, atol=1e-12)
-    assert valid.all()
-
-
-def test_class_mean_shift_does_not_change_within_class_structure():
-    rng = np.random.default_rng(11)
-    y = np.repeat([0, 1], 25)
-    z = rng.normal(size=(50, 3))
-    z_shift = z + (y[:, None] == 1) * np.array([10.0, -7.0, 8.0])
-    m1, v1 = g._gen_within_class_similarity_matrix(pd.DataFrame(z), y)
-    m2, v2 = g._gen_within_class_similarity_matrix(pd.DataFrame(z_shift), y)
-    np.testing.assert_allclose(m1, m2, atol=1e-12)
-    np.testing.assert_array_equal(v1, v2)
-    assert not np.allclose(
-        g._gen_cosine_similarity_matrix(pd.DataFrame(z)),
-        g._gen_cosine_similarity_matrix(pd.DataFrame(z_shift)),
-    )
-
-
-def test_identifies_zero_within_class_variance_without_discarding_other_columns():
-    y = np.array([0, 0, 0, 1, 1, 1])
-    z = pd.DataFrame({
-        'perfect_main_effect': [-1, -1, -1, 1, 1, 1],
-        'x': [1, 3, 5, 1, 2, 4],
-        'other_constant': [3, 3, 3, 3, 3, 3],
-    })
-    m, valid = g._gen_within_class_similarity_matrix(z, y)
-    np.testing.assert_array_equal(valid, [False, True, False])
-    np.testing.assert_allclose(m, [[1.0]])
-
-
-def test_no_estimable_features_returns_empty_matrix_and_mask():
-    y = np.array([0, 0, 1, 1])
-    z = pd.DataFrame({'a': [0, 0, 1, 1], 'b': [3, 3, -2, -2]})
-    m, valid = g._gen_within_class_similarity_matrix(z, y)
-    assert m.shape == (0, 0)
-    assert not valid.any()
-
-
-def test_invalid_weights():
-    y = np.array([0, 0, 1, 1])
-    z = pd.DataFrame({'a': [1, 2, 1, 2]})
-    with pytest.raises(ValueError, match='positive total weight'):
-        g._gen_within_class_similarity_matrix(z, y, np.zeros(4))
-    with pytest.raises(ValueError, match='Each class'):
-        g._gen_within_class_similarity_matrix(z, y, np.array([0, 0, 1, 1]))
-
-
-def test_old_cosine_method_unchanged_and_main_effect_remains(monkeypatch):
-    n = 12
-    y = np.repeat([0, 1], n // 2)
-    X = pd.DataFrame({
-        'a': np.array([-1] * 6 + [1] * 6, dtype=float),
-        'b': np.arange(n, dtype=float) % 4,
-        'c': np.arange(n, dtype=float) % 5,
-    })
-    z = X.copy()
-    monkeypatch.setattr(g, 'make_sample_weight', lambda w, n: np.ones(n), raising=False)
-    monkeypatch.setattr(g, 'generate_disc', lambda *args, **kwargs: {}, raising=False)
-    monkeypatch.setattr(g, 'apply_disc', lambda *args, **kwargs: X, raising=False)
-    monkeypatch.setattr(g, '_calculate_training_woe', lambda *args, **kwargs: {'woe_table': z})
-    monkeypatch.setattr(g, '_filter_variables_with_woe', lambda _Xd, _y, nodes, _edges, **kwargs: nodes)
-
-    observed = []
-    def fake_estimator(m, *_args, **_kwargs):
-        observed.append(m.copy())
-        return np.eye(len(m))
-    monkeypatch.setattr(g, '_calc_partial_correlations', fake_estimator)
-
-    m_cos = g.graphical_woe_transformer(X, y, structure_method='cosine')
-    np.testing.assert_allclose(observed[-1], g._gen_cosine_similarity_matrix(z))
-    assert m_cos['nodes'] == ['a', 'b', 'c']
-
-    m_cls = g.graphical_woe_transformer(X, y, structure_method='within_class')
-    expected, valid = g._gen_within_class_similarity_matrix(z, y)
-    np.testing.assert_allclose(observed[-1], expected)
-    assert not valid[0]
-    assert m_cls['nodes'] == ['a', 'b', 'c']
-    assert m_cls['pcor'].loc['a', 'a'] == 1
-    np.testing.assert_allclose(m_cls['pcor'].loc['a', ['b','c']].values, 0)
-
-    est = g.GraphicalWoETransformer()
-    assert est.structure_method == 'within_class'
-    assert est.get_params()['structure_method'] == 'within_class'
-    est.set_params(structure_method='cosine')
-    est.fit(X, y)
-    assert est.get_pcor().shape == (3, 3)
-
-
-def test_all_class_constant_variables_can_remain_main_effects(monkeypatch):
-    y = np.array([0, 0, 1, 1])
-    X = pd.DataFrame({'a': [-1, -1, 1, 1], 'b': [1, 1, -1, -1]})
-    monkeypatch.setattr(g, 'make_sample_weight', lambda w, n: np.ones(n), raising=False)
-    monkeypatch.setattr(g, 'generate_disc', lambda *args, **kwargs: {}, raising=False)
-    monkeypatch.setattr(g, 'apply_disc', lambda *args, **kwargs: X, raising=False)
-    monkeypatch.setattr(g, '_calculate_training_woe', lambda *args, **kwargs: {'woe_table': X})
-    monkeypatch.setattr(g, '_filter_variables_with_woe', lambda _Xd, _y, nodes, _edges, **kwargs: nodes)
-    result = g.graphical_woe_transformer(X, y, structure_method='within_class')
-    assert result['edges'] == {}
-    assert result['nodes'] == ['a', 'b']
-    np.testing.assert_allclose(result['pcor'], np.eye(2))
