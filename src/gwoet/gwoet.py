@@ -36,10 +36,14 @@ X_test2 = transform_dataset(gwt, X_test)
 dnb = discrete_naive_bayes(X_train2, y_train)
 pred = predict_dnb(dnb, X_test2)
 
-Class
------
+Classes
+-------
 GraphicalWoETransformer:
   Scikit-learn-compatible transformer for graphical WoE transformation.
+
+GraphicalWoETransformerCV:
+  GraphicalWoETransformer whose pruning_ratio is selected by inner
+  cross-validation (paired rule by default).
 
 GraphicalWoETransformer methods
 -------------------------------
@@ -75,21 +79,27 @@ X_test2 = tfm.transform(X_test)
 gwoet = tfm.get_transformer()
 pcor = tfm.get_pcor()
 
+tfm_cv = GraphicalWoETransformerCV(estimator=l1_pipeline(), random_state=42)
+tfm_cv.fit(X_train, y_train)
+tfm_cv.best_pruning_ratio_
+tfm_cv.cv_results_
 
-Author: annyms7519
+
+Author: Toshiki Mori
 Created: 2024-07-05
-Last modified: 2026-10-07
+Last modified: 2026-11-19
 Version: 0.9.0.5
 License: MIT
 """
-
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.covariance import graphical_lasso
+from sklearn.metrics import get_scorer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import StratifiedKFold
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted
 
@@ -114,11 +124,15 @@ else:
 
 
 # constants
-GAMMA = 0.5             # EBIC high-dimensional penalty parameter.
-EBIC_THRESHOLD = False  # Whether to threshold weak precision-matrix elements.
-PRUNING_RATIO = 0.0     # Fraction of weakest partial-correlation edges to prune.
-ZERO_TOL = 1e-8         # Numerical tolerance for zero precision entries.
-MIN_IV = 0.02           # Minimum IV used for variable pruning.
+STRUCTURE_METHOD = "cosine"  # "cosine" or "within_class".
+GAMMA = 0.5                  # EBIC high-dimensional penalty parameter (Foygel & Drton, 2010).
+EBIC_THRESHOLD = False       # Whether to threshold weak precision-matrix elements.
+PRUNING_RATIO = 0.0          # Fraction of weakest partial-correlation edges to prune.
+PRUNING_RATIOS = (0.0, 0.1, 0.2, 0.3, 0.4,
+                  0.5, 0.6, 0.7, 0.8, 0.9)  # Candidates for GraphicalWoETransformerCV.
+SELECTION = "paired"         # "paired" or "best" for GraphicalWoETransformerCV.
+ZERO_TOL = 1e-8              # Numerical tolerance for zero precision entries.
+MIN_IV = 0.02                # Minimum IV used for variable pruning.
 
 
 def _validate_real(
@@ -177,6 +191,7 @@ def graphical_woe_transformer(
     cross_fitting=True,
     n_splits=5,
     shuffle=True,
+    structure_method=STRUCTURE_METHOD,
     gamma=GAMMA,
     ebic_threshold=EBIC_THRESHOLD,
     pruning_ratio=PRUNING_RATIO,
@@ -211,6 +226,10 @@ def graphical_woe_transformer(
         Whether to shuffle observations before constructing the
         cross-fitting folds. This argument is used only when
         cross_fitting is True.
+      structure_method:
+        "within_class" (default) estimates the correlation matrix of
+        class-centered WoE residuals; "cosine" reproduces the original
+        WoE cosine-similarity method. The target is never a matrix column.
       gamma:
         Non-negative EBIC high-dimensional penalty parameter used when
         selecting the Graphical Lasso regularization strength. Larger values
@@ -237,9 +256,12 @@ def graphical_woe_transformer(
         pcor:
           Full EBIC-estimated partial correlation matrix, before percentage
           pruning or IV pruning. Zero-norm WoE variables are excluded from
-          estimation. This matrix may contain variables/edges absent from
-          the final nodes/edges. If no WoE variable is estimable, a zero
-          placeholder matrix is returned with the original-feature fallback.
+          estimation. For within_class, variables with zero within-class
+          variance remain as isolated nodes (diagonal 1, edges 0), so
+          they can still contribute main effects. This matrix may
+          contain variables/edges absent from the final nodes/edges.
+          If all original WoE vectors have zero norm, the original-feature
+          fallback returns a zero placeholder matrix.
         numeric:
           Whether numerical variables are kept as numerical variables.
         nodes:
@@ -296,6 +318,11 @@ def graphical_woe_transformer(
     if pruning_ratio >= 1.0:
         raise ValueError("pruning_ratio must be less than 1.0.")
 
+    if structure_method not in ("within_class", "cosine"):
+        raise ValueError(
+            "structure_method must be 'within_class' or 'cosine'."
+        )
+
     if not isinstance(numeric, bool):
         raise TypeError("numeric must be a boolean.")
 
@@ -322,6 +349,58 @@ def graphical_woe_transformer(
 
     weight = make_sample_weight(weight, len(X))
 
+    structure = _fit_structure(
+        X,
+        y,
+        weight,
+        discretizer=discretizer,
+        cross_fitting=cross_fitting,
+        n_splits=n_splits,
+        shuffle=shuffle,
+        structure_method=structure_method,
+        gamma=gamma,
+        ebic_threshold=ebic_threshold,
+        numeric=numeric,
+        random_state=random_state,
+        verbose=verbose,
+    )
+
+    return _build_transformer(
+        structure,
+        pruning_ratio,
+        verbose=verbose,
+    )
+
+
+def _fit_structure(
+    X,
+    y,
+    weight,
+    *,
+    discretizer,
+    cross_fitting,
+    n_splits,
+    shuffle,
+    structure_method,
+    gamma,
+    ebic_threshold,
+    numeric,
+    random_state,
+    verbose=False,
+):
+    """
+    Run the pruning-independent part of the GWoET fit.
+
+    Discretization, training WoE and the EBIC Graphical Lasso estimate
+    (for either structure_method) do not depend on pruning_ratio. Their
+    result can therefore be reused to build transformers for several
+    pruning ratios (see _build_transformer()).
+
+    Returns:
+      Dict describing the fitted structure. If all original WoE vectors
+      have zero norm, the dict contains the key "fallback" holding the
+      original-feature fallback transformer.
+    """
     disc = generate_disc(
         X,
         y,
@@ -357,29 +436,113 @@ def graphical_woe_transformer(
     if len(woe_table.columns) == 0:
         if verbose:
             print("All variables were pruned. The original features are used instead.")
-        return _fallback_transformer(
-            X,
-            disc,
-            numeric,
-        )
+        return {
+            'fallback': _fallback_transformer(
+                X,
+                disc,
+                numeric,
+            ),
+        }
 
     nodes = list(woe_table.columns)
     if verbose:
         print(f"Nodes: {len(nodes)}")
-    random_state = check_random_state(random_state)
-    mat = _gen_cosine_similarity_matrix(woe_table)
-    pcor_values = _calc_partial_correlations(
-        mat,
-        X.shape[0],
-        gamma=gamma,
-        ebic_threshold=ebic_threshold,
-        verbose=verbose,
-    )
+    if structure_method == "cosine":
+        # Preserve the original GWoET structure-estimation path.
+        mat = _gen_cosine_similarity_matrix(woe_table)
+        pcor_values = _calc_partial_correlations(
+            mat,
+            X.shape[0],
+            gamma=gamma,
+            ebic_threshold=ebic_threshold,
+            verbose=verbose,
+        )
+    else:
+        # Remove class-specific means (the linear effect of Y) before
+        # learning the X-X precision matrix. No Y column is added.
+        mat, valid = _gen_within_class_similarity_matrix(
+            woe_table, y, weight=weight
+        )
+        # A zero-residual-variance column is not graph-estimable,
+        # but it may still be informative as a main-effect feature.
+        pcor_values = np.eye(len(nodes), dtype=float)
+        valid_idx = np.flatnonzero(valid)
+        if len(valid_idx) > 0:
+            selected_pcor = _calc_partial_correlations(
+                mat,
+                X.shape[0],
+                gamma=gamma,
+                ebic_threshold=ebic_threshold,
+                verbose=verbose,
+            )
+            pcor_values[np.ix_(valid_idx, valid_idx)] = selected_pcor
+        if verbose:
+            print(
+                "Within-class structure: "
+                f"{len(valid_idx)}/{len(nodes)} estimable features"
+            )
     pcor = pd.DataFrame(
         pcor_values,
         index=nodes,
         columns=nodes,
     )
+
+    return {
+        'X': X,
+        'X_d': X_d,
+        'y': y,
+        'weight': weight,
+        'disc': disc,
+        'numeric': numeric,
+        'nodes': nodes,
+        'pcor': pcor,
+        'cross_fitting': cross_fitting,
+        'n_splits': n_splits,
+        'shuffle': shuffle,
+        # The original random_state is kept. check_random_state() is
+        # applied in _build_transformer(), which reproduces the behavior
+        # of the single-pass implementation. Pass an integer seed so that
+        # every pruning ratio uses the same cross-fitting folds in the
+        # IV filter.
+        'random_state': random_state,
+    }
+
+
+def _build_transformer(
+    structure,
+    pruning_ratio,
+    *,
+    verbose=False,
+):
+    """
+    Build a transformer from a fitted structure for one pruning ratio.
+
+    This runs percentage pruning, interaction-term generation and IV
+    pruning, which are the only steps that depend on pruning_ratio.
+    """
+    if 'fallback' in structure:
+        return structure['fallback']
+
+    pruning_ratio = _validate_real(
+        pruning_ratio,
+        "pruning_ratio",
+    )
+    if pruning_ratio >= 1.0:
+        raise ValueError("pruning_ratio must be less than 1.0.")
+
+    X = structure['X']
+    X_d = structure['X_d']
+    y = structure['y']
+    weight = structure['weight']
+    disc = structure['disc']
+    numeric = structure['numeric']
+    nodes = list(structure['nodes'])
+    pcor = structure['pcor']
+    pcor_values = pcor.to_numpy()
+    random_state = check_random_state(structure['random_state'])
+    cross_fitting = structure['cross_fitting']
+    n_splits = structure['n_splits']
+    shuffle = structure['shuffle']
 
     # Optionally prune a fraction of the weakest EBIC partial-correlation edges.
     candidate_values = _prune_edges_by_ratio(
@@ -673,6 +836,68 @@ def _gen_cosine_similarity_matrix(
     np.fill_diagonal(mat, 1.0)
 
     return mat
+
+
+
+def _gen_within_class_similarity_matrix(woe_table, y, weight=None):
+    """Return weighted class-centered WoE correlation and estimable columns.
+
+    Let A_i = Z_i - E_w[Z | Y=y_i]. The returned matrix is the
+    correlation of A columns; class labels are not included as a column.
+
+    Columns with zero within-class variation are excluded from the returned
+    matrix but identified by a Boolean mask. The caller preserves these
+    features for main-effect selection while forbidding incident graph edges.
+
+    When weight is None, all samples receive equal weight.
+    """
+    if not isinstance(woe_table, pd.DataFrame):
+        raise TypeError("woe_table must be a pandas DataFrame.")
+
+    Z = woe_table.to_numpy(dtype=float, copy=True)
+    y = np.asarray(y)
+    if y.ndim != 1 or len(y) != len(Z):
+        raise ValueError("y must be a one-dimensional array aligned with woe_table.")
+    if not np.isfinite(Z).all():
+        raise ValueError("woe_table must contain finite values.")
+
+    if weight is None:
+        w = np.ones(len(y), dtype=float)
+    else:
+        w = np.asarray(weight, dtype=float)
+        if w.ndim != 1 or len(w) != len(y):
+            raise ValueError("weight must be a vector aligned with y.")
+        if not np.isfinite(w).all() or np.any(w < 0.0):
+            raise ValueError("weight must be finite and nonnegative.")
+
+    total = w.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("weight must have positive total weight.")
+    w = w / total
+
+    A = Z.copy()
+    for k in pd.unique(y):
+        mask = y == k
+        mass = w[mask].sum()
+        if mass <= 0.0:
+            raise ValueError("Each class must have positive total weight.")
+        A[mask] -= np.average(Z[mask], axis=0, weights=w[mask])
+
+    # Weighted Gram matrix of residuals: positive semidefinite by construction.
+    WA = A * np.sqrt(w)[:, None]
+    d = np.linalg.norm(WA, axis=0)
+    # Relative tolerance avoids artificial graph nodes due to cancellation.
+    scale = np.maximum(np.max(np.abs(Z), axis=0), 1e-12)
+    valid = d > 1e-12 * scale
+
+    if not np.any(valid):
+        return np.empty((0, 0), dtype=float), valid
+
+    V = WA[:, valid] / d[valid]
+    mat = V.T @ V
+    mat = (mat + mat.T) / 2.0
+    np.fill_diagonal(mat, 1.0)
+    return mat, valid
 
 
 def _calc_partial_correlations(
@@ -1695,6 +1920,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         cross_fitting=True,
         n_splits=5,
         shuffle=True,
+        structure_method=STRUCTURE_METHOD,
         gamma=GAMMA,
         ebic_threshold=EBIC_THRESHOLD,
         pruning_ratio=PRUNING_RATIO,
@@ -1706,6 +1932,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
         self.cross_fitting = cross_fitting
         self.n_splits = n_splits
         self.shuffle = shuffle
+        self.structure_method = structure_method
         self.gamma = gamma
         self.ebic_threshold = ebic_threshold
         self.pruning_ratio = pruning_ratio
@@ -1736,6 +1963,7 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
             cross_fitting=self.cross_fitting,
             n_splits=self.n_splits,
             shuffle=self.shuffle,
+            structure_method=self.structure_method,
             gamma=self.gamma,
             ebic_threshold=self.ebic_threshold,
             pruning_ratio=self.pruning_ratio,
@@ -1855,3 +2083,255 @@ class GraphicalWoETransformer(BaseEstimator, TransformerMixin):
             dtype=object,
         )
 
+
+"""
+scikit-learn compliant class that selects pruning_ratio by cross-validation.
+"""
+class GraphicalWoETransformerCV(GraphicalWoETransformer):
+    """
+    GWoET whose pruning_ratio is selected by inner cross-validation.
+
+    For each inner fold, the pruning-independent structure (discretization,
+    WoE and EBIC Graphical Lasso) is fitted once, and transformers for all
+    candidate pruning ratios are built from it. Each candidate is scored by
+    fitting a clone of `estimator` on the transformed inner-training data.
+    After selection, the transformer is refitted on all data with the
+    selected ratio.
+
+    Use this class inside a Pipeline with the same downstream estimator and
+    evaluate the Pipeline with an outer CV (nested CV). The outer test fold
+    is then never used for selecting pruning_ratio.
+
+    Args (in addition to GraphicalWoETransformer, except pruning_ratio):
+      estimator:
+        Downstream estimator (or Pipeline) that accepts the output of
+        transform(), e.g. the same L1 pipeline used after GWoET.
+      pruning_ratios:
+        Candidate pruning ratios. Ratio 0.0 is added automatically
+        because it is the reference of the paired rule.
+      cv:
+        Number of inner stratified folds, or a CV splitter.
+      scoring:
+        scikit-learn scoring name or callable scorer.
+      selection:
+        "paired" (default): largest (sparsest) ratio whose fold-wise
+        paired score difference from pruning_ratio=0, averaged over
+        folds, is at least -tolerance. Because every ratio is evaluated
+        on the same folds, fold-to-fold variation cancels out in the
+        differences. This rule does not assume that the score decreases
+        monotonically.
+        "best": ratio with the highest mean score (ties: larger ratio).
+      tolerance:
+        Allowed mean score loss for selection="paired". If None, the
+        standard error of the paired difference of each ratio is used
+        (a paired one-standard-error rule). Ignored for "best".
+
+    Attributes:
+      best_pruning_ratio_:
+        Selected pruning ratio.
+      cv_results_:
+        DataFrame with, per candidate ratio, the mean/SE score, the mean
+        number of interaction terms, the mean/SE paired difference from
+        pruning_ratio=0 (mean_diff, se_diff), the per-fold scores
+        (split{k}_score) and, for selection="paired", the tolerance used
+        and whether the ratio is within it.
+    """
+
+    def __init__(
+        self,
+        estimator=None,
+        *,
+        pruning_ratios=PRUNING_RATIOS,
+        cv=5,
+        scoring="roc_auc",
+        selection=SELECTION,
+        tolerance=None,
+        discretizer='bic',
+        cross_fitting=True,
+        n_splits=5,
+        shuffle=True,
+        structure_method=STRUCTURE_METHOD,
+        gamma=GAMMA,
+        ebic_threshold=EBIC_THRESHOLD,
+        numeric=True,
+        random_state=None,
+        verbose=False,
+    ):
+        self.estimator = estimator
+        self.pruning_ratios = pruning_ratios
+        self.cv = cv
+        self.scoring = scoring
+        self.selection = selection
+        self.tolerance = tolerance
+        self.discretizer = discretizer
+        self.cross_fitting = cross_fitting
+        self.n_splits = n_splits
+        self.shuffle = shuffle
+        self.structure_method = structure_method
+        self.gamma = gamma
+        self.ebic_threshold = ebic_threshold
+        self.numeric = numeric
+        self.random_state = random_state
+        self.verbose = verbose
+
+    def _fit_structure_on(
+        self,
+        X,
+        y,
+        weight,
+        random_state,
+    ):
+        return _fit_structure(
+            X,
+            y,
+            make_sample_weight(weight, len(X)),
+            discretizer=self.discretizer,
+            cross_fitting=self.cross_fitting,
+            n_splits=self.n_splits,
+            shuffle=self.shuffle,
+            structure_method=self.structure_method,
+            gamma=_validate_real(self.gamma, "gamma"),
+            ebic_threshold=self.ebic_threshold,
+            numeric=self.numeric,
+            random_state=random_state,
+            verbose=False,
+        )
+
+    def fit(
+        self,
+        X,
+        y,
+        weight=None,
+    ):
+        if self.estimator is None:
+            raise ValueError("estimator must be specified.")
+        if self.selection not in ("paired", "best"):
+            raise ValueError("selection must be 'paired' or 'best'.")
+        if self.structure_method not in ("within_class", "cosine"):
+            raise ValueError(
+                "structure_method must be 'within_class' or 'cosine'."
+            )
+        tolerance = (
+            None if self.tolerance is None
+            else _validate_real(self.tolerance, "tolerance")
+        )
+
+        ratios = {
+            _validate_real(r, "pruning_ratio") for r in self.pruning_ratios
+        }
+        # Ratio 0.0 is the reference of the paired differences.
+        ratios.add(0.0)
+        ratios = sorted(ratios)
+        if ratios[-1] >= 1.0:
+            raise ValueError("pruning_ratios must be less than 1.0.")
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame.")
+        y_arr = np.asarray(y)
+        w_arr = None if weight is None else np.asarray(weight)
+
+        # A fixed integer seed keeps cross-fitting folds identical
+        # across candidate ratios, so differences reflect pruning only.
+        rs = check_random_state(self.random_state)
+        seed = int(rs.randint(np.iinfo(np.int32).max))
+
+        if isinstance(self.cv, (int, np.integer)):
+            splitter = StratifiedKFold(
+                n_splits=int(self.cv),
+                shuffle=True,
+                random_state=seed,
+            )
+        else:
+            splitter = self.cv
+
+        scorer = get_scorer(self.scoring)
+        scores = {r: [] for r in ratios}
+        n_terms = {r: [] for r in ratios}
+
+        for k, (tr, va) in enumerate(splitter.split(X, y_arr)):
+            X_tr, X_va = X.iloc[tr], X.iloc[va]
+            y_tr, y_va = y_arr[tr], y_arr[va]
+            w_tr = None if w_arr is None else w_arr[tr]
+
+            structure = self._fit_structure_on(X_tr, y_tr, w_tr, seed)
+
+            for r in ratios:
+                tfm = _build_transformer(structure, r)
+                Z_tr = transform_dataset(tfm, X_tr)
+                Z_va = transform_dataset(tfm, X_va)
+                est = clone(self.estimator).fit(Z_tr, y_tr)
+                scores[r].append(scorer(est, Z_va, y_va))
+                n_terms[r].append(len(tfm['edges']))
+
+            if self.verbose:
+                print(
+                    f"inner fold {k}: "
+                    + ", ".join(f"{r:.2f}:{scores[r][-1]:.4f}" for r in ratios)
+                )
+
+        def _se(values):
+            values = np.asarray(values, dtype=float)
+            if len(values) < 2:
+                return 0.0
+            return values.std(ddof=1) / np.sqrt(len(values))
+
+        res = pd.DataFrame({
+            'pruning_ratio': ratios,
+            'mean_score': [np.mean(scores[r]) for r in ratios],
+            'se_score': [_se(scores[r]) for r in ratios],
+            'mean_n_interactions': [np.mean(n_terms[r]) for r in ratios],
+        })
+
+        # Paired differences from pruning_ratio=0 on the same folds.
+        ref = np.asarray(scores[0.0], dtype=float)
+        diffs = {r: np.asarray(scores[r], dtype=float) - ref for r in ratios}
+        res['mean_diff'] = [diffs[r].mean() for r in ratios]
+        res['se_diff'] = [_se(diffs[r]) for r in ratios]
+
+        for k in range(len(ref)):
+            res[f'split{k}_score'] = [scores[r][k] for r in ratios]
+
+        if self.selection == "paired":
+            res['tolerance'] = (
+                tolerance if tolerance is not None else res['se_diff']
+            )
+            res['within_tolerance'] = res['mean_diff'] >= -res['tolerance']
+            best = res.loc[
+                res['within_tolerance'],
+                'pruning_ratio',
+            ].max()
+        else:
+            best_score = res['mean_score'].max()
+            best = res.loc[
+                res['mean_score'] >= best_score,
+                'pruning_ratio',
+            ].max()
+
+        self.cv_results_ = res
+        self.best_pruning_ratio_ = float(best)
+
+        # Refit on all data with the selected ratio.
+        fitted = graphical_woe_transformer(
+            X,
+            y,
+            weight=weight,
+            discretizer=self.discretizer,
+            cross_fitting=self.cross_fitting,
+            n_splits=self.n_splits,
+            shuffle=self.shuffle,
+            structure_method=self.structure_method,
+            gamma=self.gamma,
+            ebic_threshold=self.ebic_threshold,
+            pruning_ratio=self.best_pruning_ratio_,
+            numeric=self.numeric,
+            random_state=seed,
+            verbose=self.verbose,
+        )
+        self.coef_ = fitted
+        self.classes_ = np.array(pd.Categorical(y).categories)
+        self.n_features_in_ = X.shape[1]
+        self.feature_names_in_ = np.asarray(
+            X.columns,
+            dtype=object,
+        )
+        return self
