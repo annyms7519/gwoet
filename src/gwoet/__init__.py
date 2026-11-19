@@ -32,6 +32,7 @@ from .dnb import (
 )
 from .gwoet import (
     GraphicalWoETransformer,
+    GraphicalWoETransformerCV,
     draw_graphical_model,
     gen_graph_data,
     graphical_woe_transformer,
@@ -67,6 +68,7 @@ __all__ = [
 
     # Graphical WoE Transformer
     "GraphicalWoETransformer",
+    "GraphicalWoETransformerCV",
     "graphical_woe_transformer",
     "is_graphical_woe_transformer",
     "transform_dataset",
